@@ -42,12 +42,29 @@ def infer_cadence(
         if profile.avg_words <= 8.0 or profile.short_bias > 0.65:
             target_len = "one" if n <= 3 else "short"
 
-    # --- поведение: реактивное если юзер редко спрашивает
-    behavior = "reactive" if (profile and profile.q_ratio < 0.18) else "balanced"
+    # --- поведение: если юзер часто спрашивает → можно проактивнее
+    if profile and profile.q_ratio >= 0.28:
+        behavior = "proactive"
+    elif profile and profile.q_ratio < 0.18:
+        behavior = "reactive"
+    else:
+        behavior = "balanced"
 
-    # --- вопросы: спрашиваем только если нас спросили И нет двух вопросів подряд от нас
+    # --- вопросы: если нас спросили — спрашиваем; иначе допускаем умеренную инициативу
     q_tail = sum(1 for t in last_two_assistant if (t or "").rstrip().endswith("?"))
-    ask = bool(is_question and q_tail == 0 and behavior != "reactive")
+    ask = False
+    if is_question and q_tail == 0 and behavior != "reactive":
+        ask = True
+    else:
+        # проактивная попытка: если нет хвоста из наших вопросов и поведение позволяет
+        can_proactive = (q_tail == 0) and (behavior in ("balanced", "proactive"))
+        n_words = n
+        looks_like_share = bool(re.search(
+            r"\b(ездил|катался|делал|получилось|смотрел|читал|готовил|работал|тренир|учил)\w*\b",
+            (user_text or ""), re.IGNORECASE,
+        ))
+        if can_proactive and (n_words >= 6 or looks_like_share):
+            ask = True
 
     # Образность/предложения:
     imagery_cap = 1 if target_len in ("medium", "long") and n >= 10 else 0

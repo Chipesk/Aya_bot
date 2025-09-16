@@ -37,6 +37,6 @@ def plan_response(turn: int, user_text: str, last_topic: Optional[str], em: Opti
     if em.label == "interest" or ASK_MORE_RE.search(t):
         return Plan("topic_followup", "give_example", "answer", "plain", "medium", False)
 
-    # 4) Иначе — плавное продолжение прошлой темы
+    # 4) Иначе — плавное продолжение прошлой темы, но с мягким вопросом
     topic = last_topic or "life"
-    return Plan(topic, "smalltalk_continue", "ack", "plain", "short", False)
+    return Plan(topic, "smalltalk_continue", "ack", "plain", "short", True)

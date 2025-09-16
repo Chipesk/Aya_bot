@@ -296,6 +296,9 @@ class AyaBrain:
         plan = plan_response(turn, user_text, topic, em=em)
         await self.memory.set_topic(tg_user_id, plan.topic)
 
+        # комбинированное решение об вопросе
+        ask_flag = bool(cad.ask or getattr(plan, "ask", False))
+
         history = await self.history.last(tg_user_id, limit=8)
         last_two_assistant_texts = [m.get("content", "") for m in history if m.get("role") == "assistant"][-2:]
         last_assistant_text = last_two_assistant_texts[-1] if last_two_assistant_texts else ""
@@ -354,26 +357,61 @@ class AyaBrain:
             tone=None,
         )
 
+        # --- адресация: подготовка формы обращения ---
+        # prefs, display_name, plan, cad, em, dialog_mode, consent, flirt_level, adult_ok, greet, weather_allowed
+        # предполагаю, что у тебя уже есть в этом месте (как в предыдущем коде).
+        nickname_allowed = bool(prefs.get("nickname_allowed", False))
+        nickname = (prefs.get("nickname") or "").strip() or None
+        display_name_safe = (display_name or "").strip() or None
+
+        # «тёплость» обращения берём из режима/уровня близости
+        # (можешь подцепить реальную близость из памяти, пока возьмём 0 как дефолт)
+        affinity = int(user_state.get("affinity", 0)) if "user_state" in locals() else 0
+
+        # affection_mode: "none" | "warm" | "romantic"
+        if str(flirt_level) in ("romantic", "suggestive") or plan.tone in ("romantic", "suggestive"):
+            affection_mode = "romantic"
+        elif consent or plan.tone == "soft":
+            affection_mode = "warm"
+        else:
+            affection_mode = "none"
+
+        address_form = pick_address_form(
+            display_name=display_name_safe,
+            nickname=nickname,
+            nickname_allowed=nickname_allowed,
+            affection_mode=affection_mode,
+            affinity=affinity,
+            tone=(plan.tone or "off"),
+        )
+
+        # общий флаг: задаём вопрос?
+        ask_flag = bool(cad.ask or getattr(plan, "ask", False))
+
         # --- BRIEF для генератора ---
+        # предполагается, что выше объявлен ask_flag = bool(cad.ask or getattr(plan, "ask", False))
         brief = (
             "REPLY_BRIEF:\n"
             f"- style.length={cad.target_len}\n"
             f"- style.tone={plan.tone}\n"
-            f"- ask_question={'yes' if cad.ask else 'no'}\n"
+            f"- ask_question={'yes' if ask_flag else 'no'}\n"
             f"- topic_focus={plan.topic}\n"
             f"- avoid_weather_numbers=true\n"
+
             "- address:\n"
             f"    nickname_allowed={'true' if prefs['nickname_allowed'] else 'false'}\n"
             f"    nickname='{prefs['nickname'] or ''}'\n"
             f"    full_name='{display_name or ''}'\n"
-            "- variation:\n"
-            f"    allow_one_word={'true' if cad.target_len == 'one' else 'false'}\n"
-            f"    allow_microstory={'true' if cad.target_len in ('medium','long') else 'false'}\n"
             f"- address.use={'yes' if (should_use_address(cad.target_len, plan.tone, affinity) and address_form) else 'no'}\n"
             f"- address.form='{address_form or ''}'\n"
+
+            "- variation:\n"
+            f"    allow_one_word={'true' if cad.target_len == 'one' else 'false'}\n"
+            f"    allow_microstory={'true' if cad.target_len in ('medium', 'long') else 'false'}\n"
             f"- imagery_cap={cad.imagery_cap}\n"
             f"- clause_cap={cad.clause_cap}\n"
             f"- formality={cad.formality}\n"
+
             f"- dialog.mood={em.label}\n"
             f"- dialog.mood_intensity={em.intensity}\n"
             f"- act={plan.act}\n"
@@ -381,31 +419,37 @@ class AyaBrain:
             f"- tone={plan.tone}\n"
             f"- emoji_mirror={'yes' if cad.emoji_mirror else 'no'}\n"
             f"- weather_allowed={'yes' if weather_allowed else 'no'}\n"
+
             f"- greeting.allow={'yes' if greet['allow'] else 'no'}\n"
             f"- greeting.kind={greet['kind']}\n"
+
             "- intimacy:\n"
             f"    adult_confirmed={'yes' if adult_ok else 'no'}\n"
             f"    flirt.consent={'yes' if consent else 'no'}\n"
             f"    flirt.level={flirt_level}\n"
             f"    dialog.mode={dialog_mode}\n"
+
+            "- structure:\n"
+            "    reaction=yes           # короткая эмпатия/оценка сказанного\n"
+            "    self_share=small       # один конкретный штрих/наблюдение от себя по теме\n"
+            f"    followup_question={'yes' if ask_flag else 'no'}  # открытый вопрос, если уместно\n"
+
             "STYLE_RULES:\n"
             "- Если dialog.mode != 'roleplay': без *звёздочных* ремарок и без рассказа от третьего лица; пиши от 1-го лица.\n"
-            "- Если dialog.mode == 'roleplay': ремарки *...* разрешены, 3-е лицо возможно, но без графических подробностей.\n"
-            "- Не начинай описание сцены/атмосферы без прямого запроса.\n"
-            "- Длина фраз преимущественно 6–14 слов, вариативный ритм.\n"
-            "- Если ask_question=no — не инициируй вопросов и просьб «поделиться/рассказать/прислать».\n"
+            "- Если dialog.mode == 'roleplay': ремарки *...* разрешены, 3-е лицо возможно, но без графических подробностей (fade-to-black).\n"
+            "- Не начинай описание сцены/атмосферы без прямого запроса пользователя.\n"
+            "- Длина фраз преимущественно 6–14 слов; ритм вариативный, без «простыней».\n"
+            "- Если ask_question=no — не инициируй вопросов и просьб «поделиться/прислать».\n"
             "- Вопрос в конце — только если ask_question=yes.\n"
-            "- Держись текущего настроения собеседника (dialog.mood).\n"
-            "- При sad/anxiety/tired — поддерживай, не меняй тему резко, не дави вопросами.\n"
-            "- При joy — раздели эмоцию и уточни детали.\n"
+            "- Держись текущего настроения собеседника (dialog.mood); при sad/anxiety/tired — поддержка, мягкие уточнения, без резких смен тем.\n"
+            "- Избегай штампов и канцелярита; максимум одна образная фраза в ответе.\n"
+            "- Адресация: если nickname_allowed=true и задан nickname — используй его; иначе полное имя; без прозвищ.\n"
 
-            "GUIDE:\n"
-            "1) Соблюдай length и тон. Можно одно слово или микроисторию — без воды.\n"
-            "2) Если nickname_allowed=true и nickname задан — обращайся по нему, иначе по полному имени, без прозвищ.\n"
-            "3) Держи topic_focus; тему можно мягко смещать, но не резко.\n"
-            "4) Если weather_allowed=no — вообще не упоминай погоду/дождь/ветер.\n"
-            "5) Если greeting.allow=no — не начинай ответ с «Привет/Здравствуйте». Если kind=ack — коротко признай приветствие.\n"
-            "6) Пользуйся только USER_FACTS, не приписывай собеседнику мои слова.\n"
+            "CONTENT_HOOKS:\n"
+            "- Если пользователь делится опытом/достижением — отзеркаль эмоцию, добавь крошку личного опыта и спроси уместную деталь.\n"
+            "- Если weather_allowed=no — вообще не упоминай погоду/дождь/ветер; числа о погоде — только по прямому запросу.\n"
+            "- Соблюдай границы интимности и согласие; не поднимай уровень без явного сигнала.\n"
+            "- Пользуйся только USER_FACTS; не приписывай пользователю мои слова.\n"
         )
 
         messages = [
