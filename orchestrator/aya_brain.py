@@ -292,6 +292,31 @@ class AyaBrain:
         except Exception:
             pass
 
+        # 7) Имя и ник — начать знакомство заново
+        try:
+            await self.memory.set_user_display_name(tg_user_id, "")
+        except Exception:
+            pass
+        try:
+            await self.memory.set_user_nickname(tg_user_id, "")
+        except Exception:
+            pass
+        try:
+            await self.memory.set_user_nickname_allowed(tg_user_id, False)
+        except Exception:
+            pass
+
+        # Жёстко сбросим last_bot_greet_at, если метод не принимает None — ставим «очень старую» дату
+        try:
+            await self.memory.set_last_bot_greet_at(tg_user_id, None)
+        except TypeError:
+            try:
+                await self.memory.set_last_bot_greet_at(tg_user_id, "1970-01-01T00:00:00")
+            except Exception:
+                pass
+        except Exception:
+            pass
+
     async def _collect_user_facts(self, tg_user_id: int) -> list[str]:
         name = await self.memory.get_user_display_name(tg_user_id)
         prefs = await self.memory.get_user_prefs(tg_user_id)

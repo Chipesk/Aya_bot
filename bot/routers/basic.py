@@ -139,33 +139,25 @@ async def reset_name(message: types.Message, memory_repo, tg_user_id: int):
 async def cmd_start(message: types.Message, aya_brain, memory_repo):
     tg_user_id = message.from_user.id
 
-    # Полный сброс
+    # Полный сброс состояния (история, тема, ласковость, имя/ник, приветы)
     await aya_brain.reset_user(tg_user_id)
 
-    # Текущее время/таймзона
+    # Начинаем знакомство всегда одинаково, без проверок last_greet_iso/имени
+    text = "Привет! Я Ая. Давай знакомиться. Как тебя зовут?"
+    await message.reply(text)
+
+    # Заодно пометим «привет» текущим временем, чтобы статистика была консистентной
     now = datetime.now(ZoneInfo("Europe/Moscow"))
+    await memory_repo.set_last_bot_greet_at(tg_user_id, now.isoformat(timespec="seconds"))
+    await memory_repo.inc_daily_greet(tg_user_id, now.strftime("%Y%m%d"))
 
-    name = await memory_repo.get_user_display_name(tg_user_id)
-    last_greet_iso = await memory_repo.get_last_bot_greet_at(tg_user_id)
-
-    greet_again = True
-    if last_greet_iso:
-        try:
-            delta = now - datetime.fromisoformat(last_greet_iso)
-            greet_again = delta.total_seconds() > 2 * 60 * 60
-        except Exception:
-            greet_again = True
-
-    if greet_again:
-        if name:
-            await message.reply(f"Привет, {name}! Как день?")
-        else:
-            await message.reply("Привет! Я Ая. Давай знакомиться. Как мне к тебе обращаться?")
-        # корректно проставляем метки
-        await memory_repo.set_last_bot_greet_at(tg_user_id, now.isoformat(timespec="seconds"))
-        await memory_repo.inc_daily_greet(tg_user_id, now.strftime("%Y%m%d"))
-    else:
-        await message.reply(f"Я здесь{', ' + name if name else ''} 🙂 Продолжим?")
+    # Имя
+    name = extract_name(text)
+    if name:
+        await memory_repo.set_user_display_name(tg_user_id, name)
+        await message.answer(f"Приятно, {name}! Запомнила 😊")
+        await memory_repo.clear_dialog_state(tg_user_id)
+        return
 
 
 @router.message(Command("help"))
