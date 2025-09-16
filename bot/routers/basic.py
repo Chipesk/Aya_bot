@@ -50,11 +50,48 @@ def extract_name(text: str) -> str | None:
         return None
     return cand[:1].upper() + cand[1:]
 
+BAD_FORMS = {"лёха", "леха", "алекс", "алексиус", "саня", "димон", "серёга", "серега"}
+
+def _is_bad_nick(nick: str) -> bool:
+    s = (nick or "").strip().lower()
+    if not (2 <= len(s) <= 20):
+        return True
+    if s in BAD_FORMS:
+        return True
+    # можно дополнить: запрет emoji/знаков
+    return False
+
+
 def suggest_nick(display_name: str) -> list[str]:
     mapping = {
-        "Алексей": ["Лёша", "Алекс"],
+        "Алексей": ["Лёша", "Алёша"],
+        "Александр": ["Саша"],
+        "Дмитрий": ["Дима"],
+        "Михаил": ["Миша"],
+        "Сергей": ["Серёжа"],
+        "Евгений": ["Женя"],
+        "Павел": ["Паша"],
+        "Роман": ["Рома"],
+        "Илья": ["Илья"],
+        "Владимир": ["Вова"],
+        "Тимофей": ["Тима"],
+        "Максим": ["Макс"],
+        "Анна": ["Аня"],
+        "Екатерина": ["Катя"],
+        "Мария": ["Маша"],
+        "Ольга": ["Оля"],
+        "Елена": ["Лена"],
+        "Юлия": ["Юля"],
+        "Наталья": ["Наташа"],
+        "Ирина": ["Ира"],
+        "Светлана": ["Света"],
+        "Виктория": ["Вика"],
+        "Карина": ["Кариша"],
     }
-    return mapping.get(display_name, [])
+    opts = mapping.get(display_name, [])
+    # фильтр на всякий случай
+    return [o for o in opts if o.strip().lower() not in BAD_FORMS]
+
 
 def human_weather(world: dict) -> str:
     w = world.get("weather", {}) or {}
@@ -99,8 +136,14 @@ async def reset_name(message: types.Message, memory_repo, tg_user_id: int):
     await message.answer("Имя и ник сброшены. Скажи: «меня зовут Имя», чтобы я запомнила.")
 
 @router.message(CommandStart())
-async def start(message: types.Message, memory_repo, tg_user_id: int):
-    await memory_repo.touch_seen(tg_user_id)
+async def cmd_start(message: types.Message, aya_brain, memory_repo):
+    tg_user_id = message.from_user.id
+
+    # Полный сброс
+    await aya_brain.reset_user(tg_user_id)
+
+    # Текущее время/таймзона
+    now = datetime.now(ZoneInfo("Europe/Moscow"))
 
     name = await memory_repo.get_user_display_name(tg_user_id)
     last_greet_iso = await memory_repo.get_last_bot_greet_at(tg_user_id)
@@ -108,7 +151,7 @@ async def start(message: types.Message, memory_repo, tg_user_id: int):
     greet_again = True
     if last_greet_iso:
         try:
-            delta = datetime.now(ZoneInfo("Europe/Moscow")) - datetime.fromisoformat(last_greet_iso)
+            delta = now - datetime.fromisoformat(last_greet_iso)
             greet_again = delta.total_seconds() > 2 * 60 * 60
         except Exception:
             greet_again = True
@@ -117,11 +160,13 @@ async def start(message: types.Message, memory_repo, tg_user_id: int):
         if name:
             await message.reply(f"Привет, {name}! Как день?")
         else:
-            await message.reply("Привет! Я Ая. Расскажи, как день? Можешь сказать «меня зовут …», и я запомню 🙂")
-        await memory_repo.set_last_bot_greet_at(tg_user_id)  # отметили
-        await memory_repo.inc_daily_greet(tg_user_id)  # счётчик дня
+            await message.reply("Привет! Я Ая. Давай знакомиться. Как мне к тебе обращаться?")
+        # корректно проставляем метки
+        await memory_repo.set_last_bot_greet_at(tg_user_id, now.isoformat(timespec="seconds"))
+        await memory_repo.inc_daily_greet(tg_user_id, now.strftime("%Y%m%d"))
     else:
         await message.reply(f"Я здесь{', ' + name if name else ''} 🙂 Продолжим?")
+
 
 @router.message(Command("help"))
 async def help_cmd(message: types.Message):
@@ -220,7 +265,7 @@ async def free_chat(message: types.Message, tg_user_id: int, aya_brain, memory_r
     # Ласковость
     if AFF_STRICT_RE.search(text):
         await memory_repo.set_user_affection_mode(tg_user_id, "none")
-        await message.answer("Хорошо, буду обращаться строго и без уменьшительных.")
+        await message.answer("Хорошо. Буду обращаться строго по имени, без уменьшительных.")
         return
     if AFF_ROM_RE.search(text):
         await memory_repo.set_user_affection_mode(tg_user_id, "romantic")
@@ -262,6 +307,10 @@ async def free_chat(message: types.Message, tg_user_id: int, aya_brain, memory_r
     m_nick = NICK_SET_RE.search(text)
     if m_nick:
         nick = m_nick.group(2).strip()
+        if _is_bad_nick(nick):
+            await message.answer(
+                "Так не очень звучит. Напиши, пожалуйста, как тебе комфортно, например «зови меня Лёша».")
+            return
         await memory_repo.set_user_nickname_allowed(tg_user_id, True)
         await memory_repo.set_user_nickname(tg_user_id, nick)
         await memory_repo.clear_dialog_state(tg_user_id)
@@ -298,10 +347,14 @@ async def free_chat(message: types.Message, tg_user_id: int, aya_brain, memory_r
 
             # одно слово — считаем ником (только пока свежо)
             if is_fresh and re.fullmatch(r"[A-Za-zА-Яа-яЁё\-]{2,20}", text):
+                candidate = text.strip()
+                if _is_bad_nick(candidate):
+                    await message.answer("Поняла. Лучше что-то нейтральное и без просторечий.")
+                    return
                 await memory_repo.set_user_nickname_allowed(tg_user_id, True)
-                await memory_repo.set_user_nickname(tg_user_id, text.strip())
+                await memory_repo.set_user_nickname(tg_user_id, candidate)
                 await memory_repo.clear_dialog_state(tg_user_id)
-                await message.answer(f"Отлично! Тогда «{text.strip()}».")
+                await message.answer(f"Отлично! Тогда «{candidate}».")
                 return
 
             if NO_RE.match(text):

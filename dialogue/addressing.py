@@ -1,6 +1,20 @@
 # dialogue/addressing.py
 from random import choice, random
 
+RUS_NAME_VARIANTS = {
+    "Алексей": ["Лёша", "Алёша"],
+    # сюда можно добавить и другие имена по мере необходимости
+}
+
+PETNAMES_SOFT = ["дорогой", "милый"]
+PETNAMES_ROMANTIC = ["котик", "зайчик", "родной"]
+
+def generate_name_variants(full_name: str | None) -> list[str]:
+    if not full_name:
+        return []
+    base = full_name.strip()
+    return [base] + RUS_NAME_VARIANTS.get(base, [])
+
 def pick_address_form(display_name: str | None, nickname: str | None,
                       nickname_allowed: bool, affection_mode: str,
                       affinity: int, tone: str) -> str | None:
@@ -30,6 +44,32 @@ def pick_address_form(display_name: str | None, nickname: str | None,
     base = display_name.strip() if display_name else None
     if not base:
         return None
+
+    # 2.1 эволюция обращения: Alexey -> Лёша/Алёша -> (романтика) нежные слова
+    # Стадии:
+    # 0 — только полное имя
+    # 1 — разрешены короткие варианты (если известны)
+    # 2 — при романтическом тоне и согласии допускаются нежные слова
+    stage = 0
+    # тон + явное согласие дают право поднять стадию
+    if tone in ("soft", "romantic", "suggestive", "roleplay"):
+        stage = 1
+    if tone in ("romantic", "suggestive", "roleplay") and affection_mode == "romantic":
+        stage = 2
+
+    # соберём пул кандидатов
+    variants = generate_name_variants(base)
+    pool = [base] if stage == 0 or not variants else variants
+
+    # нежные — только при stage 2
+    if stage >= 2:
+        # чем выше близость — тем чаще может «случиться» нежное слово
+        p_pet = 0.10 + max(0, min(0.25, 0.02 * max(0, affinity)))
+        if random() < p_pet:
+            pet_pool = PETNAMES_ROMANTIC if tone in ("romantic", "suggestive", "roleplay") else PETNAMES_SOFT
+            pool = pool + pet_pool
+
+    return choice(pool)
 
     # Без прозвищ и уменьшительных, строго по имени
     return base

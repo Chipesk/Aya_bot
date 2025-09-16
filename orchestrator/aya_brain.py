@@ -224,6 +224,74 @@ class AyaBrain:
     async def health_check(self):
         return await self.deepseek.health_check()
 
+    async def reset_user(self, tg_user_id: int):
+        # 1) История диалога
+        try:
+            await self.history.clear(tg_user_id)
+        except Exception:
+            pass
+
+        # 2) Диалоговые состояния / тема
+        try:
+            await self.memory.set_topic(tg_user_id, "")
+        except Exception:
+            pass
+        try:
+            # предпочтительно: явный сброс intent/payload/ts
+            await self.memory.set_dialog_state(tg_user_id, intent="", payload="", ts=None)
+        except Exception:
+            try:
+                # фолбэк: если есть только clear_dialog_state()
+                await self.memory.clear_dialog_state(tg_user_id)
+            except Exception:
+                pass
+
+        # 3) Приветствия/счётчики
+        try:
+            # если метод принимает (id, iso) — шлём None; если без iso — ловим и игнорируем
+            await self.memory.set_last_bot_greet_at(tg_user_id, None)
+        except TypeError:
+            try:
+                await self.memory.set_last_bot_greet_at(tg_user_id)
+            except Exception:
+                pass
+        except Exception:
+            pass
+        try:
+            await self.memory.reset_daily_greet(tg_user_id)
+        except Exception:
+            try:
+                # возможная альтернатива, если есть сеттер
+                await self.memory.set_daily_greet(tg_user_id, 0)
+            except Exception:
+                pass
+
+        # 4) Формы обращения, чтобы начать «с чистого листа»
+        try:
+            await self.memory.remove_set_fact(tg_user_id, "address_allow")
+        except Exception:
+            pass
+        try:
+            await self.memory.remove_set_fact(tg_user_id, "address_deny")
+        except Exception:
+            pass
+
+        # 5) Флирт/согласия
+        try:
+            await self.memory.set_flirt_consent(tg_user_id, False)
+        except Exception:
+            pass
+        try:
+            await self.memory.set_flirt_level(tg_user_id, "off")
+        except Exception:
+            pass
+
+        # 6) Близость/симпатия
+        try:
+            await self.memory.set_affinity(tg_user_id, 0)
+        except Exception:
+            pass
+
     async def _collect_user_facts(self, tg_user_id: int) -> list[str]:
         name = await self.memory.get_user_display_name(tg_user_id)
         prefs = await self.memory.get_user_prefs(tg_user_id)
@@ -296,13 +364,29 @@ class AyaBrain:
         plan = plan_response(turn, user_text, topic, em=em)
         await self.memory.set_topic(tg_user_id, plan.topic)
 
-        # комбинированное решение об вопросе
-        ask_flag = bool(cad.ask or getattr(plan, "ask", False))
-
         history = await self.history.last(tg_user_id, limit=8)
         last_two_assistant_texts = [m.get("content", "") for m in history if m.get("role") == "assistant"][-2:]
         last_assistant_text = last_two_assistant_texts[-1] if last_two_assistant_texts else ""
         cad = infer_cadence(user_text, last_two_assistant_texts, profile=profile)
+
+        # --- dead-end detector ---
+        SHORT_ACK_RE = re.compile(r"^\s*(ок(ей)?|ну ок|понял[а]?|ясно|угу|ладно)\.?\s*$", re.IGNORECASE)
+        user_ack = bool(SHORT_ACK_RE.match(user_text or ""))
+
+        # если короткий кивок, и мы не планировали спрашивать — мягко оживляем
+        if user_ack and not getattr(cad, "ask", False):
+            cad.ask = True  # дать шанс вопросу
+
+        # комбинированное решение об вопросе
+        ask_flag = bool(cad.ask or getattr(plan, "ask", False))
+
+        # если два наших последних ответа уже были с вопросом — текущий не вопрос
+        q_tail_forced = sum(1 for t in last_two_assistant_texts if (t or "").rstrip().endswith("?"))
+        if q_tail_forced >= 2:
+            ask_flag = False
+
+        # сигнал для генератора: мы оживляем разговор
+        rescue_hint = 'yes' if user_ack else 'no'
 
         DETAIL_RE = re.compile(r"\b(расскажи|поясни|пример|что это|как это|почему)\b", re.IGNORECASE)
         if DETAIL_RE.search(user_text or ""):
@@ -346,16 +430,7 @@ class AyaBrain:
         user_facts_block = "USER_FACTS:\n" + ("\n".join(user_facts) if user_facts else "none")
 
         # --- обращение ---
-        affection_mode = await self.memory.get_user_affection_mode(tg_user_id)
         affinity = await self.memory.get_affinity(tg_user_id)
-        address_form = pick_address_form(
-            display_name=display_name,
-            nickname=prefs["nickname"],
-            nickname_allowed=prefs["nickname_allowed"],
-            affection_mode=affection_mode,
-            affinity=affinity,
-            tone=None,
-        )
 
         # --- адресация: подготовка формы обращения ---
         # prefs, display_name, plan, cad, em, dialog_mode, consent, flirt_level, adult_ok, greet, weather_allowed
@@ -364,9 +439,6 @@ class AyaBrain:
         nickname = (prefs.get("nickname") or "").strip() or None
         display_name_safe = (display_name or "").strip() or None
 
-        # «тёплость» обращения берём из режима/уровня близости
-        # (можешь подцепить реальную близость из памяти, пока возьмём 0 как дефолт)
-        affinity = int(user_state.get("affinity", 0)) if "user_state" in locals() else 0
 
         # affection_mode: "none" | "warm" | "romantic"
         if str(flirt_level) in ("romantic", "suggestive") or plan.tone in ("romantic", "suggestive"):
@@ -399,9 +471,9 @@ class AyaBrain:
             f"- avoid_weather_numbers=true\n"
 
             "- address:\n"
-            f"    nickname_allowed={'true' if prefs['nickname_allowed'] else 'false'}\n"
-            f"    nickname='{prefs['nickname'] or ''}'\n"
-            f"    full_name='{display_name or ''}'\n"
+            f"    nickname_allowed={'true' if nickname_allowed else 'false'}\n"
+            f"    nickname='{nickname or ''}'\n"
+            f"    full_name='{display_name_safe or ''}'\n"
             f"- address.use={'yes' if (should_use_address(cad.target_len, plan.tone, affinity) and address_form) else 'no'}\n"
             f"- address.form='{address_form or ''}'\n"
 
@@ -429,6 +501,7 @@ class AyaBrain:
             f"    flirt.level={flirt_level}\n"
             f"    dialog.mode={dialog_mode}\n"
 
+            f"- rescue={rescue_hint}\n"
             "- structure:\n"
             "    reaction=yes           # короткая эмпатия/оценка сказанного\n"
             "    self_share=small       # один конкретный штрих/наблюдение от себя по теме\n"
@@ -498,7 +571,7 @@ class AyaBrain:
         content = post_style_sanitizer(
             content,
             mode=decision.mode,
-            ask_flag=bool(cad.ask),
+            ask_flag=ask_flag,  # ← заменить
             history=history,
             imagery_cap=cad.imagery_cap,
             clause_cap=cad.clause_cap,
