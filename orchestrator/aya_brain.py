@@ -1,4 +1,6 @@
 # orchestrator/aya_brain.py
+from orchestrator.integration_adapter import augment_brief
+
 import logging
 import re
 from enum import Enum
@@ -63,7 +65,7 @@ _ADULT_HINT_RE = re.compile(
     r"\b(вирт|роль(е|e)ва(я|я)|сыграем сценку|сценарий|role[- ]?play)\b",
     re.IGNORECASE
 )
-_FLIRT_SOFT_RE = re.compile(r"\b(флирт|заигрыва(ть|ем)|подмиг(иваю|нёшь))\b", re.IGNORECASE)
+_FLIRT_SOFT_RE = re.compile(r"\b(флирт|заигрыва(ть|ем)|подмиг(иваю|нёшь)|красива(я|ый)|симпатич|мила(я|й)|очаровательн|прекрасн)\w*\b", re.IGNORECASE)
 _ROMANTIC_RE = re.compile(r"\b(романтичн|нежн|ласк|обним|поцелу)\w*\b", re.IGNORECASE)
 _SUGGESTIVE_RE = re.compile(
     r"\b(возбуд|намёк|намека|жарко|интим|страсть|страстн)\w*\b", re.IGNORECASE
@@ -214,6 +216,14 @@ def post_style_sanitizer(
 # Мозг Аи
 # -----------------------------
 class AyaBrain:
+    def _goodbye_policy(self, user_text: str) -> bool:
+        """
+        Возвращает True, если пользователь явно прощается, и тогда мы можем завершить диалог тёплой фразой.
+        """
+        txt = (user_text or "").strip().lower()
+        BYE = ("пока", "до встречи", "бай", "споки", "спокойной ночи", "досвидания", "до свидания")
+        return any(txt == w or txt.startswith(w + " ") for w in BYE)
+
     def __init__(self, deepseek_client, memory_repo, world_state, chat_history, persona_manager):
         self.deepseek = deepseek_client
         self.memory = memory_repo
@@ -487,6 +497,7 @@ class AyaBrain:
 
         # --- BRIEF для генератора ---
         # предполагается, что выше объявлен ask_flag = bool(cad.ask or getattr(plan, "ask", False))
+        # --- BRIEF для генератора ---
         brief = (
             "REPLY_BRIEF:\n"
             f"- style.length={cad.target_len}\n"
@@ -548,7 +559,19 @@ class AyaBrain:
             "- Если weather_allowed=no — вообще не упоминай погоду/дождь/ветер; числа о погоде — только по прямому запросу.\n"
             "- Соблюдай границы интимности и согласие; не поднимай уровень без явного сигнала.\n"
             "- Пользуйся только USER_FACTS; не приписывай пользователю мои слова.\n"
+            "- Задавай конкретный, контекстный вопрос (не «расскажи подробнее»); привязывайся к словам пользователя: что именно? какой? когда в последний раз? зачем?\n"
+            "- Избегай односложных ответов; даже в short дай 1–2 информативные детали.\n"
         )
+
+        # --- Aya Integration Adapter: augment brief with planner, topics, palette, and style guard
+        try:
+            brief, _aya_meta = augment_brief(user_text, brief, profile, last_two_assistant_texts)
+        except Exception as _e:
+            logger = globals().get("logger", None)
+            if logger:
+                logger.warning("augment_brief failed: %s", _e)
+            else:
+                print("augment_brief failed:", _e)
 
         messages = [
             {"role": "system", "content": system_prompt},
@@ -563,12 +586,12 @@ class AyaBrain:
         raw_content = result.get("content", "…")
 
         # критик: если слишком «ИИшно», пробуем plain-fallback
-        if ai_score(raw_content) >= 4:
+        if ai_score(raw_content) >= 6:
             fallback_brief = (
                 brief
                 + "\nFORCE_PLAIN:\n"
-                  "- style.length=short\n"
-                  "- ask_question=no\n"
+                  "- style.length=medium\n"
+                  "- ask_question=yes\n"
                   "- imagery_cap=0\n"
                   "- clause_cap=1\n"
                   "- formality=plain\n"
@@ -602,6 +625,15 @@ class AyaBrain:
             clause_cap=cad.clause_cap,
         )
 
+        # Avoid premature closers: не «закрываем» разговор сами, если пользователь не прощался
+        if not self._goodbye_policy(user_text):
+            content = re.sub(
+                r"(?:^|\s)(?:Ладно|Окей|Хорошо),\s*(?:я|пойду|вернусь|возвращаюсь)[^.]*\.",
+                "",
+                content,
+                flags=re.IGNORECASE,
+            ).strip()
+
         # --- сохраняем историю ---
         await self.history.add(tg_user_id, "user", user_text)
         await self.history.add(tg_user_id, "assistant", content)
@@ -632,3 +664,5 @@ class AyaBrain:
 
         log.info(f"[content_router] mode={decision.mode.value} reason={decision.reason}")
         return content
+
+

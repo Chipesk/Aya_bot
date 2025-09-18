@@ -19,7 +19,11 @@ ASK_NAME_RE = re.compile(r"\b(как\s+меня\s+зовут|какое\s+у\s+�
 
 ASK_WEATHER_RE = re.compile(r"\b(какая|что\s+по)\s+погод[аеы]\b", re.IGNORECASE)
 ASK_DATE_RE = re.compile(r"\b(какая\s+(?:сегодня|сейчас)\s+дата|какое\s+(?:сегодня|сейчас)\s+число|дата\s*(пж|пожалуйста)?)\b", re.IGNORECASE)
-ASK_TIME_RE = re.compile(r"\b(который\s+час|сколько\s+(?:сейчас\s+)?времени|(?:а\s*)?время\??)\b", re.IGNORECASE)
+ASK_TIME_RE = re.compile(
+    r"(?:(?:^|\s)(?:который\s+час|сколько\s+(?:сейчас\s+)?времени)(?:\?|$))"
+    r"|^(?:а\s*)?время\?$",
+    re.IGNORECASE
+)
 ASK_DATETIME_BOTH_RE = re.compile(r"\b(врем[яи].*дат[аы]|дат[аы].*врем[яи])\b", re.IGNORECASE)
 
 # Никнеймы / ласковость
@@ -39,6 +43,19 @@ ASK_REMEMBER_RE = re.compile(
 )
 # Темы
 MUSIC_RE = re.compile(r"\b(музык|песня|трек|альбом|плейлист|radiohead|london\s+grammar|kid\s*a)\b", re.IGNORECASE)
+
+NEG_FREE_TIME_RE = re.compile(r"\bсвободн\w*\s+врем\w*\b", re.IGNORECASE)
+
+def is_time_question(text: str) -> bool:
+    if not text:
+        return False
+    if NEG_FREE_TIME_RE.search(text):
+        return False
+    # короткие прямые вопросы типа «который час?» «сколько времени?»
+    if len(text) <= 40 and ASK_TIME_RE.search(text):
+        return True
+    # явные формулировки
+    return bool(re.search(r"^(который\s+час|сколько\s+(?:сейчас\s+)?времени)\b", text.strip(), re.IGNORECASE))
 
 # ====== Хелперы ======
 def extract_name(text: str) -> str | None:
@@ -367,7 +384,7 @@ async def free_chat(message: types.Message, tg_user_id: int, aya_brain, memory_r
         await message.answer(now.strftime("Сегодня %d.%m.%Y"))
         return
 
-    if ASK_TIME_RE.search(text):
+    if is_time_question(text):
         now = datetime.now(ZoneInfo("Europe/Moscow"))
         await memory_repo.clear_dialog_state(tg_user_id)
         await message.answer(now.strftime("Сейчас %H:%M"))
