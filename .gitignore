@@ -1,2 +1,30 @@
-# .gitignore
+# Виртуальное окружение
+.venv/
+env/
+venv/
+
+# IDE и системные файлы
+.idea/
+.vscode/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.DS_Store
+
+# Базы данных и локальное хранилище
+*.db
+/storage/*
+!/storage/__init__.py
+
+# Конфиги с секретами
 .env
+
+# Логи
+*.log
+
+# Кэш и временные файлы
+*.sqlite3
+*.egg-info/
+dist/
+build/
