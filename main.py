@@ -6,23 +6,31 @@ import inspect
 from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
+
 from memory.facts_repo import FactsRepo
+from memory.episodes import EpisodesRepo
+from memory.repo import MemoryRepo
+from memory.chat_history import ChatHistoryRepo
 
 from core.settings import settings
 from core.logging import setup_logging
+
 from storage.db import DB
-from memory.repo import MemoryRepo
-from memory.chat_history import ChatHistoryRepo
+
 from services.deepseek_client import DeepSeekClient
 from services.world_state import WorldState
+
 from persona.loader import PersonaManager
+
 from orchestrator.aya_brain import AyaBrain
+import orchestrator.aya_brain as _brain
+
 from bot.routers.basic import router as basic_router
 from bot.middlewares.user_context import UserContextMiddleware
 
 import dialogue.cadence as _cad
 import dialogue.humanizer as _hum
-import orchestrator.aya_brain as _brain
+
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
@@ -66,13 +74,14 @@ async def app():
     memory_repo = MemoryRepo(db)
     chat_history = ChatHistoryRepo(db)
     facts_repo = FactsRepo(db)
+    episodes_repo = EpisodesRepo(db)
     # --- Services ---
     deepseek = DeepSeekClient(settings.DEEPSEEK_API_KEY or None)
     world_state = WorldState(db=db, fetcher=fetch_spb_weather, ttl_sec=900)
     persona = PersonaManager()
 
     # --- Brain ---
-    aya_brain = AyaBrain(deepseek, memory_repo, world_state, chat_history, persona, facts_repo=facts_repo)
+    aya_brain = AyaBrain(deepseek, memory_repo, world_state, chat_history, persona, facts_repo=facts_repo, episodes_repo=episodes_repo)
 
     # --- Telegram ---
     bot = Bot(
@@ -92,6 +101,7 @@ async def app():
     dp["db"] = db
     dp["deepseek"] = deepseek
     dp["facts_repo"] = facts_repo
+    dp["episodes_repo"] = episodes_repo
     # Роутеры
     dp.include_router(basic_router)
 

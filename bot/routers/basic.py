@@ -12,23 +12,17 @@ router = Router(name="basic")
 NICK_STATE_TTL = 180  # сек: окно, пока "да/ок"/одно слово считаются шагом выбора ника
 
 # ====== Регэкспы ======
-NAME_DECL_RE = re.compile(
-    r"(?:^|\b)меня\s+зовут\s+([A-Za-zА-Яа-яЁё\-]{2,20})(?:\b|$)", re.IGNORECASE
-)
+NAME_DECL_RE = re.compile(r"(?:^|\b)меня\s+зовут\s+([A-Za-zА-Яа-яЁё\-]{2,20})(?:\b|$)", re.IGNORECASE)
 ASK_NAME_RE = re.compile(r"\b(как\s+меня\s+зовут|какое\s+у\s+меня\s+имя|как\s+меня\s+называешь)\b", re.IGNORECASE)
 
 ASK_WEATHER_RE = re.compile(r"\b(какая|что\s+по)\s+погод[аеы]\b", re.IGNORECASE)
 ASK_DATE_RE = re.compile(r"\b(какая\s+(?:сегодня|сейчас)\s+дата|какое\s+(?:сегодня|сейчас)\s+число|дата\s*(пж|пожалуйста)?)\b", re.IGNORECASE)
-ASK_TIME_RE = re.compile(
-    r"(?:(?:^|\s)(?:который\s+час|сколько\s+(?:сейчас\s+)?времени)(?:\?|$))"
-    r"|^(?:а\s*)?время\?$",
-    re.IGNORECASE
-)
+ASK_TIME_RE = re.compile(r"(?:(?:^|\s)(?:который\s+час|сколько\s+(?:сейчас\s+)?времени)(?:\?|$))"r"|^(?:а\s*)?время\?$", re.IGNORECASE)
 ASK_DATETIME_BOTH_RE = re.compile(r"\b(врем[яи].*дат[аы]|дат[аы].*врем[яи])\b", re.IGNORECASE)
 
 # Никнеймы / ласковость
 NICK_ALLOW_RE = re.compile(r"\b(зови|называй|можешь\s+называть|обращайся)\b.*\b(мило|по[-\s]*доброму|ласково)\b", re.IGNORECASE)
-NICK_FORBID_RE = re.compile(r"\b(не\s+зови|не\s+называй|без\s+уменьшительных|не\s+уменьшай)\b", re.IGNORECASE)
+NICK_FORBID_RE = re.compile(r"\b(не\s+зови(те)?\s+меня|не\s+называй(те)?\s+меня|без\s+уменьшительных)\b", re.IGNORECASE)
 NICK_SET_RE = re.compile(r"\b(зови\s+меня|называй\s+меня|можешь\s+звать\s+меня)\s+([A-Za-zА-Яа-яЁё\-]{2,20})\b", re.IGNORECASE)
 NICK_INDIRECT_SET_RE = re.compile(r"\b(?:давай|просто)\s+([A-Za-zА-Яа-яЁё\-]{2,20})\b", re.IGNORECASE)
 YES_RE = re.compile(r"^(да|ок|ага|конечно|пусть|давай)\b", re.IGNORECASE)
@@ -36,11 +30,8 @@ NO_RE  = re.compile(r"^(нет|не)\b", re.IGNORECASE)
 
 AFF_WARM_RE   = re.compile(r"\b(можешь|давай)\b.*\b(ласково|теплее|по[-\s]*доброму)\b", re.IGNORECASE)
 AFF_ROM_RE    = re.compile(r"\b(можешь|давай)\b.*\b(романтич|очень\s+ласково|любимый|дорогой)\b", re.IGNORECASE)
-AFF_STRICT_RE = re.compile(r"\b(без\s+уменьшительных|строго|официально)\b", re.IGNORECASE)
-ASK_REMEMBER_RE = re.compile(
-    r"\b(что\s+ты\s+(?:помнишь|запомнила)\s+обо\s+мне|что\s+ты\s+обо\s+мне\s+зна[её]шь|что\s+запомнила\s+про\s+меня)\b",
-    re.IGNORECASE
-)
+AFF_STRICT_RE = re.compile(r"(?:(?:\bобращай(?:ся|тесь)|\bзов[ьи](?:те)?|\bназывай(?:те)?|\bпо\s+имени)\b.*\b(без\s+уменьшительных|официально|формально)\b)"r"|(?:\bбез\s+уменьшительных\b)", re.IGNORECASE)
+ASK_REMEMBER_RE = re.compile(r"\b(что\s+ты\s+(?:помнишь|запомнила)\s+обо\s+мне|что\s+ты\s+обо\s+мне\s+зна[её]шь|что\s+запомнила\s+про\s+меня)\b", re.IGNORECASE)
 # Темы
 MUSIC_RE = re.compile(r"\b(музык|песня|трек|альбом|плейлист|radiohead|london\s+grammar|kid\s*a)\b", re.IGNORECASE)
 
@@ -253,56 +244,25 @@ async def free_chat(message: types.Message, tg_user_id: int, aya_brain, memory_r
 
     # --- «что ты помнишь обо мне?» — отвечаем из памяти, не через LLM
     if ASK_REMEMBER_RE.search(text):
-        # топ фактов из универсального хранилища
         top = await facts_repo.top_facts(tg_user_id, limit=12)
-
-        # плюс совместимость со старым KV (имя/ник и т.п.)
         name = await memory_repo.get_user_display_name(tg_user_id)
         prefs = await memory_repo.get_user_prefs(tg_user_id)
 
         lines = []
-        if name:
-            lines.append(f"тебя зовут {name}")
-        if prefs.get("nickname"):
-            lines.append(f"можно звать «{prefs['nickname']}»")
+        if name: lines.append(f"тебя зовут {name}")
+        if prefs.get("nickname"): lines.append(f"можно звать «{prefs['nickname']}»")
 
-        # человекочитаемая сборка предикатов
         for it in top:
             p = it["predicate"];
             o = it["object"];
             dt = (it.get("dtype") or "str")
-            if p == "age" and dt in ("int", "str"):
-                lines.append(f"тебе {o}")
-            elif p in ("job_title", "role"):
-                lines.append(f"роль: {o}")
-            elif p in ("company", "employer"):
-                lines.append(f"компания: {o}")
-            elif p in ("industry", "domain"):
-                lines.append(f"сфера: {o}")
-            elif p.startswith("favorite_"):
-                pretty = p.replace("favorite_", "любимое ").replace("_", " ")
-                lines.append(f"{pretty}: {o}")
-            elif p in ("city", "location", "district"):
-                lines.append(f"локация: {o}")
-            elif p in ("hobby", "hobbies"):
-                lines.append(f"увлечения: {o}")
-            elif p in ("pet", "has_pet", "pet_name"):
-                lines.append(f"питомцы: {o}")
-            elif p in ("car_model", "bike_model"):
-                lines.append(f"транспорт: {o}")
-            elif p in ("adult",):
-                # не проговариваем явно; можно использовать для фильтров
+            if p == "adult":  # не проговариваем такое явно
                 continue
-            else:
-                # дефолтно показываем как «факт: значение»
-                pretty = p.replace("_", " ")
-                lines.append(f"{pretty}: {o}")
+            pretty = p.replace("_", " ")
+            lines.append(f"{pretty}: {o}")
 
-        text_out = (
-            "Я запомнила: " + "; ".join(dict.fromkeys(lines)) + "."
-            if lines else
-            "Пока точно помню твоё имя. Можешь рассказать, чем занимаешься, возраст, увлечения — я сохраню."
-        )
+        text_out = ("Я запомнила: " + "; ".join(dict.fromkeys(lines)) + ".") if lines else \
+            "Пока точно помню твоё имя. Расскажи ещё, и я сохраню."
         await message.answer(text_out)
         return
 
@@ -321,11 +281,15 @@ async def free_chat(message: types.Message, tg_user_id: int, aya_brain, memory_r
         await message.answer(f"Приятно, {text.strip().title()}! Запомнила 😊")
         return
 
-    # Ласковость
+    # Ласковость — только если есть явный контекст про форму обращения
     if AFF_STRICT_RE.search(text):
-        await memory_repo.set_user_affection_mode(tg_user_id, "none")
-        await message.answer("Хорошо. Буду обращаться строго по имени, без уменьшительных.")
-        return
+        # Доп. проверка: в тексте должны присутствовать слова про обращение/ник
+        if re.search(r"\b(обращай|зови|называй|ник|по\s+имени|уменьшительн)", text, re.IGNORECASE):
+            await memory_repo.set_user_affection_mode(tg_user_id, "none")
+            await message.answer("Поняла. Буду обращаться строго по имени.")
+            return
+        # иначе — игнор (например, «строго соблюдать диету»)
+
     if AFF_ROM_RE.search(text):
         await memory_repo.set_user_affection_mode(tg_user_id, "romantic")
         await message.answer("Поняла. Буду нежнее — но деликатно.")

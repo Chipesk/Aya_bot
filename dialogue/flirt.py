@@ -156,8 +156,7 @@ async def apply_flirt_state(memory_repo, tg_user_id: int, intent: str) -> str:
 
     if intent == "age_ok":
         await memory_repo.set_adult_confirmed(tg_user_id, True)
-        # Согласие на флирт остаётся как было — пользователь может дать его отдельно
-        return "Хорошо, поняла, что ты взрослый. Если хочешь, можем продолжить мягко."
+        return ""  # раньше было «Хорошо, поняла, что ты взрослый…»
 
     # Согласие/открытие флирта
     if intent in ("open", "consent"):
@@ -168,17 +167,17 @@ async def apply_flirt_state(memory_repo, tg_user_id: int, intent: str) -> str:
     # Понижение/повышение
     if intent == "softer":
         await memory_repo.set_flirt_level(tg_user_id, "soft")
-        return "Сделаю мягче."
+        return ""  # было «Сделаю мягче.»
 
     if intent == "warmer":
         next_level = _step_up(current_level, cap="suggestive")
         await memory_repo.set_flirt_level(tg_user_id, next_level)
-        return "Чуть смелее — но деликатно."
+        return ""  # было «Чуть смелее — но деликатно.»
 
     # Мягко «взрослый» тон → suggestive (намёки)
     if intent == "suggestive":
         await memory_repo.set_flirt_level(tg_user_id, "suggestive")
-        return "Понимаю намёк. Давай останемся деликатными."
+        return ""  # было «Оставим без подробностей…»/и т.п.
 
     # Ролевой режим (вирт/сценка) — только при adult_confirmed и consent
     if intent == "roleplay":

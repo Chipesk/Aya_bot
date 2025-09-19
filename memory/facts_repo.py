@@ -1,149 +1,183 @@
 # memory/facts_repo.py
-import json
+from __future__ import annotations
+from typing import Any, Dict, List, Optional, Tuple
+from sqlite3 import OperationalError
 import time
-from typing import Iterable, Optional
+import re
+
+_TOKEN_RE = re.compile(r"[0-9A-Za-zА-Яа-яЁё]+", re.UNICODE)
+
+def _fts_phrase(text: str, max_tokens: int = 8) -> Optional[str]:
+    toks = _TOKEN_RE.findall(text or "")
+    if not toks: return None
+    phrase = " ".join(toks[:max_tokens]).replace('"','""')
+    return f'"{phrase}"' if phrase else None
 
 class FactsRepo:
     """
-    Универсальное KV-трипловое хранилище фактов о пользователе:
-    (subject, predicate, object) + тип, единицы, уверенность, время, источник.
-    Ничего не «жёстко зашито»: любые предикаты и значения.
+    Универсальные факты про пользователя, БЕЗ whitelist.
+    Таблица:
+      facts(
+        id INTEGER PK AUTOINCREMENT,
+        tg_user_id INTEGER NOT NULL,
+        predicate TEXT NOT NULL,   -- произвольный ключ (e.g., "pets", "work_place", "loves_fish")
+        object TEXT NOT NULL,      -- произвольное значение
+        confidence REAL NOT NULL,  -- 0..1
+        source_msg_id INTEGER NULL,
+        updated_at REAL NOT NULL,
+        created_at REAL NOT NULL
+      )
+    FTS: facts_fts(predicate, object) для поиска/слияния.
     """
-    def __init__(self, db):
+
+    def __init__(self, db: Any):
+        if not hasattr(db, "conn"):
+            raise ValueError("FactsRepo expects db.conn")
         self.db = db
         self._ready = False
+        self._table = "facts"
+        self._fts = "facts_fts"
 
-    async def _ensure_table(self):
-        if self._ready:
-            return
-        await self.db.conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS mem_facts (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER NOT NULL,
-                subject TEXT NOT NULL DEFAULT 'user',
-                predicate TEXT NOT NULL,
-                object TEXT NOT NULL,
-                dtype TEXT,
-                unit TEXT,
-                confidence REAL NOT NULL DEFAULT 0.7,
-                source TEXT,
-                source_msg_id INTEGER,
-                created_at REAL NOT NULL,
-                updated_at REAL NOT NULL,
-                last_seen_at REAL NOT NULL,
-                expires_at REAL,
-                UNIQUE(user_id, subject, predicate, object)
-            )
-            """
-        )
-        await self.db.conn.execute(
-            "CREATE INDEX IF NOT EXISTS ix_mem_facts_user_pred ON mem_facts(user_id, predicate)"
-        )
+    async def _ensure(self):
+        if self._ready: return
+        await self.db.conn.execute(f"""
+        CREATE TABLE IF NOT EXISTS {self._table}(
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          tg_user_id INTEGER NOT NULL,
+          predicate TEXT NOT NULL,
+          object TEXT NOT NULL,
+          confidence REAL NOT NULL,
+          source_msg_id INTEGER NULL,
+          updated_at REAL NOT NULL,
+          created_at REAL NOT NULL
+        );
+        """)
+        await self.db.conn.execute(f"CREATE INDEX IF NOT EXISTS idx_{self._table}_user ON {self._table}(tg_user_id);")
+        await self.db.conn.execute(f"CREATE INDEX IF NOT EXISTS idx_{self._table}_pred ON {self._table}(predicate);")
+        # FTS
+        await self.db.conn.execute(f"""
+        CREATE VIRTUAL TABLE IF NOT EXISTS {self._fts}
+        USING fts5(predicate, object, tg_user_id UNINDEXED, fact_id UNINDEXED, tokenize='unicode61');
+        """)
+        # триггеры синхры
+        await self.db.conn.execute(f"""
+        CREATE TRIGGER IF NOT EXISTS {self._table}_ai AFTER INSERT ON {self._table} BEGIN
+          INSERT INTO {self._fts}(rowid, predicate, object, tg_user_id, fact_id)
+          VALUES (new.id, new.predicate, new.object, new.tg_user_id, new.id);
+        END;""")
+        await self.db.conn.execute(f"""
+        CREATE TRIGGER IF NOT EXISTS {self._table}_ad AFTER DELETE ON {self._table} BEGIN
+          INSERT INTO {self._fts}({self._fts}, rowid) VALUES ('delete', old.id);
+        END;""")
+        await self.db.conn.execute(f"""
+        CREATE TRIGGER IF NOT EXISTS {self._table}_au AFTER UPDATE ON {self._table} BEGIN
+          INSERT INTO {self._fts}({self._fts}, rowid) VALUES ('delete', old.id);
+          INSERT INTO {self._fts}(rowid, predicate, object, tg_user_id, fact_id)
+          VALUES (new.id, new.predicate, new.object, new.tg_user_id, new.id);
+        END;""")
         await self.db.conn.commit()
         self._ready = True
 
-    async def upsert_fact(
-        self,
-        user_id: int,
-        predicate: str,
-        obj: str,
-        *,
-        subject: str = "user",
-        dtype: Optional[str] = None,
-        unit: Optional[str] = None,
-        confidence: float = 0.7,
-        source: Optional[str] = "chat",
-        source_msg_id: Optional[int] = None,
-        ttl_sec: Optional[int] = None,
-    ):
-        await self._ensure_table()
+    # --------- CRUD / UPSERT ---------
+
+    async def upsert_many(self, tg_user_id: int, facts: List[Dict], source_msg_id: Optional[int] = None):
+        """
+        facts: [{predicate, object, confidence}]
+        Без whitelist. Нормализуем, режем слишком длинное, апдейтим confidence (max/EMA).
+        """
+        await self._ensure()
         now = time.time()
-        exp = (now + ttl_sec) if ttl_sec else None
-        try:
-            await self.db.conn.execute(
-                """
-                INSERT INTO mem_facts
-                (user_id, subject, predicate, object, dtype, unit, confidence, source, source_msg_id,
-                 created_at, updated_at, last_seen_at, expires_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (user_id, subject, predicate, str(obj), dtype, unit, float(confidence), source, source_msg_id,
-                 now, now, now, exp),
+        # упрощённый дедуп по (predicate, object)
+        for f in facts:
+            pred = (f.get("predicate") or "").strip()
+            obj  = (f.get("object") or "").strip()
+            conf = float(f.get("confidence") or 0.0)
+            if not pred or not obj:
+                continue
+            if conf < 0.4:  # мягкий порог, можно настроить
+                continue
+            if len(pred) > 128 or len(obj) > 2048:
+                continue
+
+            # пробуем найти близкий факт (точное совпадение для простоты)
+            cur = await self.db.conn.execute(
+                f"SELECT id, confidence FROM {self._table} WHERE tg_user_id=? AND predicate=? AND object=? LIMIT 1",
+                (tg_user_id, pred, obj)
             )
-        except Exception:
-            # уже существует — обновим уверенность (макс), время и пр.
-            await self.db.conn.execute(
-                """
-                UPDATE mem_facts
-                SET confidence = CASE WHEN confidence > ? THEN confidence ELSE ? END,
-                    dtype = COALESCE(?, dtype),
-                    unit = COALESCE(?, unit),
-                    source = COALESCE(?, source),
-                    source_msg_id = COALESCE(?, source_msg_id),
-                    updated_at = ?,
-                    last_seen_at = ?,
-                    expires_at = COALESCE(?, expires_at)
-                WHERE user_id=? AND subject=? AND predicate=? AND object=?
-                """,
-                (float(confidence), float(confidence), dtype, unit, source, source_msg_id,
-                 now, now, exp, user_id, subject, predicate, str(obj)),
-            )
+            row = await cur.fetchone(); await cur.close()
+            if row:
+                fact_id, old_conf = row[0], float(row[1])
+                new_conf = max(old_conf, conf)  # можно сделать EMA:  new = 0.7*old + 0.3*conf
+                await self.db.conn.execute(
+                    f"UPDATE {self._table} SET confidence=?, updated_at=? WHERE id=?",
+                    (new_conf, now, fact_id)
+                )
+            else:
+                await self.db.conn.execute(
+                    f"""INSERT INTO {self._table}(tg_user_id, predicate, object, confidence, source_msg_id, updated_at, created_at)
+                        VALUES(?,?,?,?,?,?,?)""",
+                    (tg_user_id, pred, obj, conf, source_msg_id, now, now)
+                )
         await self.db.conn.commit()
 
-    async def purge_expired(self):
-        await self._ensure_table()
-        now = time.time()
-        await self.db.conn.execute("DELETE FROM mem_facts WHERE expires_at IS NOT NULL AND expires_at < ?", (now,))
-        await self.db.conn.commit()
-
-    async def get_facts(self, user_id: int, predicates: Optional[Iterable[str]] = None):
-        await self._ensure_table()
-        if predicates:
-            qs = ",".join("?" for _ in predicates)
-            cur = await self.db.conn.execute(
-                f"SELECT subject, predicate, object, dtype, unit, confidence, last_seen_at FROM mem_facts "
-                f"WHERE user_id=? AND predicate IN ({qs}) ORDER BY confidence DESC, last_seen_at DESC",
-                (user_id, *predicates),
-            )
-        else:
-            cur = await self.db.conn.execute(
-                "SELECT subject, predicate, object, dtype, unit, confidence, last_seen_at "
-                "FROM mem_facts WHERE user_id=? ORDER BY confidence DESC, last_seen_at DESC",
-                (user_id,),
-            )
-        rows = await cur.fetchall()
+    async def get_all(self, tg_user_id: int, limit: int = 200) -> List[Dict]:
+        await self._ensure()
+        cur = await self.db.conn.execute(
+            f"""SELECT id, predicate, object, confidence, source_msg_id, created_at, updated_at
+                FROM {self._table}
+                WHERE tg_user_id=?
+                ORDER BY updated_at DESC, confidence DESC
+                LIMIT ?""",
+            (tg_user_id, limit)
+        )
+        rows = await cur.fetchall(); await cur.close()
         return [
             {
-                "subject": r[0],
-                "predicate": r[1],
-                "object": r[2],
-                "dtype": r[3],
-                "unit": r[4],
-                "confidence": float(r[5]),
-                "last_seen_at": float(r[6]) if r[6] is not None else None,
-            }
-            for r in rows
+                "id": r[0], "predicate": r[1], "object": r[2],
+                "confidence": float(r[3]), "source_msg_id": r[4],
+                "created_at": r[5], "updated_at": r[6]
+            } for r in rows
         ]
 
-    async def top_facts(self, user_id: int, limit: int = 12):
-        """
-        Возвращаем топ по взвешенному скору: confidence * свежесть.
-        Свежесть = 1 / (1 + дни_с_последнего_упоминания)
-        """
-        await self._ensure_table()
+    async def search(self, tg_user_id: int, query: str, limit: int = 20) -> List[Dict]:
+        await self._ensure()
+        q = (query or "").strip()
+        if not q: return []
+        phrase = _fts_phrase(q, 8)
+        if phrase:
+            try:
+                cur = await self.db.conn.execute(
+                    f"""SELECT f.id, f.predicate, f.object, f.confidence, f.source_msg_id, f.created_at, f.updated_at
+                        FROM {self._fts} x
+                        JOIN {self._table} f ON f.id = x.rowid
+                        WHERE f.tg_user_id=? AND {self._fts} MATCH ?
+                        ORDER BY bm25({self._fts})
+                        LIMIT ?""",
+                    (tg_user_id, phrase, limit)
+                )
+                rows = await cur.fetchall(); await cur.close()
+                if rows:
+                    return [
+                        {"id": r[0], "predicate": r[1], "object": r[2],
+                         "confidence": float(r[3]), "source_msg_id": r[4],
+                         "created_at": r[5], "updated_at": r[6]}
+                        for r in rows
+                    ]
+            except OperationalError:
+                pass
+        # fallback LIKE
         cur = await self.db.conn.execute(
-            "SELECT predicate, object, dtype, unit, confidence, last_seen_at "
-            "FROM mem_facts WHERE user_id=?",
-            (user_id,),
+            f"""SELECT id, predicate, object, confidence, source_msg_id, created_at, updated_at
+                FROM {self._table}
+                WHERE tg_user_id=? AND (predicate LIKE ? OR object LIKE ?)
+                ORDER BY updated_at DESC
+                LIMIT ?""",
+            (tg_user_id, f"%{q}%", f"%{q}%", limit)
         )
-        import math
-        items = []
-        now = time.time()
-        for p, o, dt, unit, conf, seen in await cur.fetchall():
-            days = max(0.0, (now - float(seen or now)) / 86400.0)
-            fresh = 1.0 / (1.0 + days)
-            score = float(conf or 0.5) * fresh
-            items.append((score, {"predicate": p, "object": o, "dtype": dt, "unit": unit}))
-        items.sort(key=lambda x: x[0], reverse=True)
-        return [it[1] for it in items[:limit]]
+        rows = await cur.fetchall(); await cur.close()
+        return [
+            {"id": r[0], "predicate": r[1], "object": r[2],
+             "confidence": float(r[3]), "source_msg_id": r[4],
+             "created_at": r[5], "updated_at": r[6]}
+            for r in rows
+        ]

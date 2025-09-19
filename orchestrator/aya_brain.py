@@ -8,7 +8,13 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
+import json
 from dialogue.fact_extractor import extract_facts_generic
+from memory.facts_repo import FactsRepo  # тип для подсказки, если хочешь
+from memory.episodes import EpisodesRepo
+from dialogue.intents import detect_intents
+from dialogue.summarizer import summarize_episode
+
 from dialogue.guardrails import Guardrails
 from dialogue.extractors import extract_facts, extract_interests
 from dialogue.cadence import infer_cadence
@@ -226,13 +232,14 @@ class AyaBrain:
         BYE = ("пока", "до встречи", "бай", "споки", "спокойной ночи", "досвидания", "до свидания")
         return any(txt == w or txt.startswith(w + " ") for w in BYE)
 
-    def __init__(self, deepseek_client, memory_repo, world_state, chat_history, persona_manager, facts_repo=None):
-        self.deepseek = deepseek_client
-        self.memory = memory_repo
-        self.world = world_state
-        self.history = chat_history
+    def __init__(self, deepseek, memory, world, history, persona, facts_repo=None, episodes_repo=None):
+        self.deepseek = deepseek
+        self.memory = memory
+        self.world = world
+        self.history = history
+        self.persona = persona
         self.facts = facts_repo
-        self.persona = persona_manager
+        self.episodes = episodes_repo
         self.guardrails = Guardrails()
 
     async def health_check(self):
@@ -349,6 +356,33 @@ class AyaBrain:
         if quiet == "1": facts.append("likes_quiet=true")
         return facts
 
+    async def summarize_user_profile(self, tg_user_id: int) -> str:
+        facts = await self.facts.get_all(tg_user_id, limit=60)
+        if not facts:
+            return "Пока я мало что знаю о тебе — но с радостью узнаю больше."
+
+        # Подготовим подсказку для LLM
+        bullets = [f"- {f['predicate']}: {f['object']} (p≈{f['confidence']:.2f})" for f in facts[:40]]
+        prompt = (
+            "Сформулируй короткое человеческое резюме о человеке на основе пунктов ниже. "
+            "Пиши естественно, 3–6 предложений, без списков и технических терминов. "
+            "Не придумывай фактов, используй только то, что дано. "
+            "Старайся быть дружественной и уважительной.\n\n" + "\n".join(bullets)
+        )
+        try:
+            # раньше тут было self.llm.short_paraphrase(...) — это падало
+            text = await self.deepseek.short_paraphrase(prompt)
+            if text and len(text.strip()) > 0:
+                return text.strip()
+        except Exception:
+            pass
+
+        # Фоллбек: аккуратные пункты, без мусора
+        lines = []
+        for f in facts[:10]:
+            lines.append(f"• {f['predicate']}: {f['object']}")
+        return "Вот что я запомнила:\n" + "\n".join(lines)
+
     async def reply(self, tg_user_id: int, user_text: str) -> str:
         # --- окружение/память ---
         turn = await self.memory.inc_turn(tg_user_id)
@@ -362,6 +396,11 @@ class AyaBrain:
         consent = await self.memory.get_flirt_consent(tg_user_id)
         flirt_level = await self.memory.get_flirt_level(tg_user_id)
         perception = self.guardrails.perceive(user_text)
+
+        # --- интенты пользователя (фикс NameError + опечаток) ---
+        intents = detect_intents(user_text or "")
+        user_asked_memory_overview = bool(intents.get("user_asked_memory_overview"))
+
         last_intent, _, ts = await self.memory.get_dialog_state(tg_user_id)
         now = datetime.now(ZoneInfo("Europe/Moscow"))
         weather_allowed = False
@@ -394,17 +433,13 @@ class AyaBrain:
             idle_seconds=idle_sec,
         )
 
-        # --- универсальное извлечение фактов из текущей реплики ---
+        # --- универсальные факты из текущей реплики ---
         if self.facts is not None and (user_text or "").strip():
             try:
                 gen_facts = await extract_facts_generic(user_text, self.deepseek)
                 for f in gen_facts:
-                    # нормализуем object в строку для хранения; числа/булеан — тоже ок, приведём к str
                     obj = f["object"]
-                    if isinstance(obj, (dict, list)):
-                        obj_str = json.dumps(obj, ensure_ascii=False)
-                    else:
-                        obj_str = str(obj)
+                    obj_str = json.dumps(obj, ensure_ascii=False) if isinstance(obj, (dict, list)) else str(obj)
                     await self.facts.upsert_fact(
                         tg_user_id,
                         predicate=f["predicate"],
@@ -415,10 +450,8 @@ class AyaBrain:
                         source="chat",
                         source_msg_id=None,
                     )
-            except Exception as _e:
-                logger = globals().get("logger", None)
-                if logger:
-                    logger.debug("extract_facts_generic failed: %s", _e)
+            except Exception:
+                pass  # мягко игнорим
 
         # --- профиль речи пользователя (EMA) ---
         profile = await update_user_profile(self.memory, tg_user_id, user_text)
@@ -439,6 +472,9 @@ class AyaBrain:
         # если короткий кивок, и мы не планировали спрашивать — мягко оживляем
         if user_ack and not getattr(cad, "ask", False):
             cad.ask = True  # дать шанс вопросу
+
+        if user_asked_memory_overview:  # ветка обзора памяти
+            return await self.summarize_user_profile(tg_user_id)
 
         # комбинированное решение об вопросе
         ask_flag = bool(getattr(cad, "ask", False) or getattr(plan, "ask", False))
@@ -515,6 +551,35 @@ class AyaBrain:
             tone=(plan.tone or "off"),
         )
 
+        # --- memory pack: факты, эпизоды, релевантные куски истории ---
+        # --- memory pack: факты, эпизоды, релевантные куски истории ---
+        facts_lines = []
+        if self.facts:
+            try:
+                # используем get_all, т.к. top_facts нет в репозитории
+                facts_top = await self.facts.get_all(tg_user_id, limit=10)
+            except TypeError:
+                # если get_all синхронный в твоей реализации
+                facts_top = self.facts.get_all(tg_user_id, limit=10)
+            except Exception:
+                facts_top = []
+
+            for f in (facts_top or []):
+                p = str(f.get("predicate", "")).replace("_", " ").strip()
+                o = f.get("object", "")
+                if p:
+                    facts_lines.append(f"- {p}: {o}")
+
+        facts_block = "FACTS:\n" + ("\n".join(facts_lines) if facts_lines else "none")
+
+        search_hits = await self.history.search_text(tg_user_id, user_text, limit=4)
+        search_lines = [f"- {h['role']}: {h['content']}" for h in search_hits] if search_hits else []
+        search_block = "RECALL:\n" + ("\n".join(search_lines) if search_lines else "none")
+
+        ep_hits = await (self.episodes.search(tg_user_id, user_text, limit=2) if self.episodes else [])
+        ep_lines = [f"- {e['title']}: {e['summary']}" for e in ep_hits] if ep_hits else []
+        episodes_block = "EPISODES:\n" + ("\n".join(ep_lines) if ep_lines else "none")
+
         # ВАЖНО: не пересчитываем ask_flag повторно после адресации
 
         # --- BRIEF для генератора ---
@@ -581,15 +646,13 @@ class AyaBrain:
         try:
             brief, _aya_meta = augment_brief(user_text, brief, profile, last_two_assistant_texts)
         except Exception as _e:
-            logger = globals().get("logger", None)
-            if logger:
-                logger.warning("augment_brief failed: %s", _e)
-            else:
-                print("augment_brief failed:", _e)
+            # используем единый логгер модуля (исправлено)
+            log.warning("augment_brief failed: %s", _e)
 
         messages = [
             {"role": "system", "content": system_prompt},
             {"role": "system", "content": user_facts_block},
+            {"role": "system", "content": facts_block + "\n" + episodes_block + "\n" + search_block},
             *history,
             {"role": "user", "content": user_text},
             {"role": "system", "content": brief},
@@ -602,14 +665,14 @@ class AyaBrain:
         # критик: если слишком «ИИшно», пробуем plain-fallback
         if ai_score(raw_content) >= 6:
             fallback_brief = (
-                    brief
-                    + "\nFORCE_PLAIN:\n"
-                      "- style.length=medium\n"
-                      "- ask_question=yes\n"
-                      "- imagery_cap=0\n"
-                      "- clause_cap=1\n"
-                      "- formality=plain\n"
-                      "- avoid_scene_openers=yes\n"
+                brief
+                + "\nFORCE_PLAIN:\n"
+                  "- style.length=medium\n"
+                  "- ask_question=yes\n"
+                  "- imagery_cap=0\n"
+                  "- clause_cap=1\n"
+                  "- formality=plain\n"
+                  "- avoid_scene_openers=yes\n"
             )
             messages_plain = [
                 {"role": "system", "content": system_prompt},
@@ -649,6 +712,36 @@ class AyaBrain:
         await self.history.add(tg_user_id, "user", user_text)
         await self.history.add(tg_user_id, "assistant", content)
 
+        # --- консолидация: каждые 12 ходов сворачиваем окно в эпизод ---
+        try:
+            if self.episodes and (turn % 12 == 0):
+                window = await self.history.last(tg_user_id, limit=30)
+                ep = await summarize_episode(window, self.deepseek)
+                if (ep.get("title") or ep.get("summary")):
+                    await self.episodes.add(
+                        tg_user_id,
+                        title=ep.get("title") or "Эпизод",
+                        summary=ep.get("summary") or "",
+                        turn_start=max(1, turn - (len(window) - 1)),
+                        turn_end=turn,
+                    )
+                # факты из эпизода — тоже кладём
+                for f in ep.get("facts") or []:
+                    obj = f.get("object")
+                    obj_str = json.dumps(obj, ensure_ascii=False) if isinstance(obj, (dict, list)) else str(obj)
+                    await self.facts.upsert_fact(
+                        tg_user_id,
+                        predicate=str(f.get("predicate") or "").lower().replace(" ", "_"),
+                        obj=obj_str,
+                        dtype=f.get("dtype"),
+                        unit=f.get("unit"),
+                        confidence=float(f.get("confidence", 0.7)),
+                        source="episode",
+                        source_msg_id=None,
+                    )
+        except Exception:
+            pass
+
         # --- долгосрочные факты + «сближение» ---
         facts = extract_facts(user_text)
         for tag in extract_interests(user_text):
@@ -675,6 +768,3 @@ class AyaBrain:
 
         log.info(f"[content_router] mode={decision.mode.value} reason={decision.reason}")
         return content
-
-
-
