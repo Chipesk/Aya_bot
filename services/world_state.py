@@ -1,84 +1,133 @@
 # services/world_state.py
 import json
-import logging
-import httpx
-from datetime import datetime, timezone, timedelta
-from zoneinfo import ZoneInfo
-from core.settings import settings
+import time
+from typing import Any, Dict, Optional
 
-log = logging.getLogger("world")
-
-SPB_LAT, SPB_LON = 59.9386, 30.3141  # Санкт-Петербург
-OPEN_METEO_URL = "https://api.open-meteo.com/v1/forecast"
 
 class WorldState:
-    def __init__(self, db):
+    def __init__(self, db, fetcher, ttl_sec: int = 900):
+        """
+        db: storage.db.DB со свойством .conn (aiosqlite)
+        fetcher: async callable -> dict  (фактический запрос погоды/контекста)
+        """
         self.db = db
+        self.fetcher = fetcher
+        self.ttl_sec = ttl_sec
+        self._ready = False
 
-    async def _fetch_weather(self) -> dict:
-        params = {
-            "latitude": SPB_LAT,
-            "longitude": SPB_LON,
-            "current_weather": True,
-            "hourly": "precipitation,temperature_2m",
-            "timezone": settings.AYA_TZ,
-        }
-        async with httpx.AsyncClient(timeout=10) as client:
-            r = await client.get(OPEN_METEO_URL, params=params)
-            r.raise_for_status()
-            return r.json()
+    async def _table_exists(self) -> bool:
+        cur = await self.db.conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='world_state'"
+        )
+        return (await cur.fetchone()) is not None
 
-    async def get_context(self) -> dict:
+    async def _ensure_table(self):
         """
-        Возвращает dict с ключами:
-        - city, tz, local_time_iso
-        - weather: {temp_c, wind, code, is_rainy}
-        Кэширует в world_state не дольше 30 минут.
+        Создаёт таблицу при отсутствии и мигрирует любую старую схему к:
+        world_state(key TEXT UNIQUE, payload TEXT NOT NULL, updated_at REAL NOT NULL)
         """
-        # попытка взять последнее состояние
-        cur = await self.db.conn.execute("SELECT payload, created_at FROM world_state ORDER BY id DESC LIMIT 1")
-        row = await cur.fetchone()
-        now_utc = datetime.now(timezone.utc)
+        if self._ready:
+            return
 
-        if row:
-            payload, created_at = row[0], row[1]
-            created = datetime.fromisoformat(created_at.replace(" ", "T"))
-            age_min = (now_utc - created.replace(tzinfo=timezone.utc)).total_seconds() / 60
-            if age_min <= 30:
-                return json.loads(payload)
+        if not await self._table_exists():
+            await self.db.conn.execute(
+                """
+                CREATE TABLE world_state (
+                    key TEXT PRIMARY KEY,
+                    payload TEXT NOT NULL,
+                    updated_at REAL NOT NULL
+                )
+                """
+            )
+            await self.db.conn.commit()
+            self._ready = True
+            return
 
-        # иначе — свежий запрос
-        js = await self._fetch_weather()
-        cw = js.get("current_weather", {}) or {}
-        temp_c = cw.get("temperature")
-        wind = cw.get("windspeed")
-        code = cw.get("weathercode")
+        # Таблица есть — проверим колонки
+        cur = await self.db.conn.execute("PRAGMA table_info('world_state')")
+        cols = {row[1] for row in await cur.fetchall()}  # row[1] = name
 
-        # грубая эвристика осадков
-        is_rainy = False
-        try:
-            hourly = js.get("hourly", {})
-            precip = hourly.get("precipitation", [0])
-            is_rainy = (precip[0] or 0) > 0
-        except Exception:
-            pass
+        # 1) Добавим key при отсутствии
+        if "key" not in cols:
+            await self.db.conn.execute("ALTER TABLE world_state ADD COLUMN key TEXT")
+            # если много строк — оставим только самую свежую (по rowid)
+            cur = await self.db.conn.execute("SELECT rowid FROM world_state")
+            rows = [r[0] for r in await cur.fetchall()]
+            if len(rows) > 1:
+                await self.db.conn.execute(
+                    "DELETE FROM world_state WHERE rowid NOT IN (SELECT MAX(rowid) FROM world_state)"
+                )
+            await self.db.conn.execute(
+                "UPDATE world_state SET key=? WHERE key IS NULL", ("spb_world",)
+            )
+            cols.add("key")
 
-        local_time = datetime.now(ZoneInfo(settings.AYA_TZ))
-        context = {
-            "city": settings.AYA_CITY,
-            "tz": settings.AYA_TZ,
-            "local_time_iso": local_time.isoformat(timespec="minutes"),
-            "weather": {
-                "temp_c": temp_c,
-                "wind": wind,
-                "code": code,
-                "is_rainy": bool(is_rainy),
-            },
-        }
+        # 2) Добавим updated_at при отсутствии
+        if "updated_at" not in cols:
+            await self.db.conn.execute("ALTER TABLE world_state ADD COLUMN updated_at REAL")
+            await self.db.conn.execute(
+                "UPDATE world_state SET updated_at=? WHERE updated_at IS NULL",
+                (time.time(),),
+            )
+            cols.add("updated_at")
 
+        # 3) Уникальный индекс по key (если PK не удалось задать ранее)
         await self.db.conn.execute(
-            "INSERT INTO world_state (city, tz, payload) VALUES (?, ?, ?)",
-            (settings.AYA_CITY, settings.AYA_TZ, json.dumps(context)),
+            "CREATE UNIQUE INDEX IF NOT EXISTS ux_world_state_key ON world_state(key)"
+        )
+
+        await self.db.conn.commit()
+        self._ready = True
+
+    async def _get_cache(self, key: str) -> Optional[Dict[str, Any]]:
+        await self._ensure_table()
+        cur = await self.db.conn.execute(
+            "SELECT payload, updated_at FROM world_state WHERE key=?",
+            (key,),
+        )
+        row = await cur.fetchone()
+        if not row:
+            return None
+        payload_s, updated_at = row
+        if updated_at is None:
+            return None
+        if (time.time() - float(updated_at)) > self.ttl_sec:
+            return None
+        try:
+            return json.loads(payload_s)
+        except Exception:
+            return None
+
+    async def _set_cache(self, key: str, payload: Dict[str, Any]):
+        await self._ensure_table()
+        await self.db.conn.execute(
+            "REPLACE INTO world_state (key, payload, updated_at) VALUES (?, ?, ?)",
+            (key, json.dumps(payload, ensure_ascii=False), time.time()),
         )
         await self.db.conn.commit()
-        return context
+
+    async def get_context(self) -> Dict[str, Any]:
+        """
+        Возвращает свежий контекст из кэша или fetcher; при сетевых ошибках
+        отдаёт последний кэш (если есть), иначе деградированный ответ.
+        """
+        key = "spb_world"
+        cached = await self._get_cache(key)
+        if cached is not None:
+            return cached
+        try:
+            fresh = await self.fetcher()
+            if not isinstance(fresh, dict):
+                fresh = {"raw": fresh}
+            await self._set_cache(key, fresh)
+            return fresh
+        except Exception:
+            # fallback на старый (возможно, просроченный) кэш
+            try:
+                cur = await self.db.conn.execute("SELECT payload FROM world_state WHERE key=?", (key,))
+                row = await cur.fetchone()
+                if row:
+                    return json.loads(row[0])
+            except Exception:
+                pass
+            return {"status": "degraded", "weather": None}

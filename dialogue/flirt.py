@@ -1,6 +1,7 @@
 # dialogue/flirt.py
 import re
 from typing import Optional
+from dialogue.guardrails import AGE_MENTION_RE, EXPLICIT_FLIRT_RE
 
 # =========================
 # УРОВНИ БЛИЗОСТИ (без NSFW)
@@ -10,6 +11,20 @@ LEVEL_INDEX = {lvl: i for i, lvl in enumerate(LEVEL_ORDER)}
 
 def _clamp(level: str) -> str:
     return level if level in LEVEL_INDEX else "off"
+
+def detect_flirt_intent(text: str):
+    t = (text or "").strip()
+    if not t:
+        return None
+
+    # Упоминание возраста само по себе — не флирт
+    if AGE_MENTION_RE.search(t):
+        return None
+
+    if EXPLICIT_FLIRT_RE.search(t):
+        return {"kind": "toggle_or_level"}  # оставь формат под свой код
+
+    return None
 
 def _step_up(level: str, cap: str) -> str:
     i = LEVEL_INDEX.get(_clamp(level), 0)

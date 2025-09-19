@@ -15,7 +15,7 @@ def _now_iso() -> str:
     return datetime.now(ZoneInfo("Europe/Moscow")).isoformat(timespec="seconds")
 
 def _today_key() -> str:
-    return datetime.now(ZoneInfo("Europe/Moscow")).strftime("%Y%m%d")
+    return datetime.now().strftime("%Y%m%d")
 
 
 class MemoryRepo:
@@ -23,7 +23,7 @@ class MemoryRepo:
         self.db = db
 
     # --- Flirt / Intimacy state ---
-    ALLOWED_FLIRT_LEVELS = {"off", "soft", "warm", "romantic", "suggestive", "erotic", "porn"}
+    ALLOWED_FLIRT_LEVELS = {"off", "soft", "romantic", "suggestive", "roleplay"}
 
     async def get_adult_confirmed(self, tg_user_id: int) -> bool:
         return (await self.get_kv(tg_user_id, "intimacy", "adult_confirmed")) == "1"
@@ -96,18 +96,23 @@ class MemoryRepo:
         return await self.get_kv(tg_user_id, "session", "last_seen")
 
     async def set_last_bot_greet_at(self, tg_user_id: int, iso: str | None = None):
-        await self.set_kv(tg_user_id, "session", "last_bot_greet_at", iso or _now_iso())
+        if iso is None:
+            await self.del_kv(tg_user_id, "session", "last_bot_greet_at")
+        else:
+            await self.set_kv(tg_user_id, "session", "last_bot_greet_at", iso)
 
     async def get_last_bot_greet_at(self, tg_user_id: int) -> Optional[str]:
         return await self.get_kv(tg_user_id, "session", "last_bot_greet_at")
 
-    async def inc_daily_greet(self, tg_user_id: int, date_key: str | None = None) -> int:
+    async def inc_daily_greet(self, tg_user_id: int, date_key: str | None = None):
         dk = date_key or _today_key()
         key = f"greet_count_{dk}"
         cur = await self.get_kv(tg_user_id, "session", key)
-        n = int(cur) + 1 if cur and cur.isdigit() else 1
-        await self.set_kv(tg_user_id, "session", key, str(n))
-        return n
+        try:
+            val = int(cur) + 1
+        except Exception:
+            val = 1
+        await self.set_kv(tg_user_id, "session", key, str(val))
 
     async def get_daily_greet(self, tg_user_id: int, date_key: str | None = None) -> int:
         dk = date_key or _today_key()
@@ -117,6 +122,14 @@ class MemoryRepo:
             return int(cur)
         except (TypeError, ValueError):
             return 0
+
+    async def reset_daily_greet(self, tg_user_id: int, date_key: str | None = None):
+        dk = date_key or _today_key()
+        await self.del_kv(tg_user_id, "session", f"greet_count_{dk}")
+
+    async def set_daily_greet(self, tg_user_id: int, value: int, date_key: str | None = None):
+        dk = date_key or _today_key()
+        await self.set_kv(tg_user_id, "session", f"greet_count_{dk}", str(int(value)))
 
     # ------- Long-term facts (мульти-значения) -------
     async def add_to_set_fact(self, tg_user_id: int, key: str, value: str):
@@ -157,6 +170,10 @@ class MemoryRepo:
         except (TypeError, ValueError):
             return 0
 
+    async def set_affinity(self, tg_user_id: int, value: int):
+        v = max(-100, min(100, int(value)))
+        await self.set_kv(tg_user_id, "dialog", "affinity", str(v))
+
     async def bump_affinity(self, tg_user_id: int, delta: int):
         cur = await self.get_affinity(tg_user_id)
         new = max(-5, min(20, cur + delta))
@@ -174,11 +191,14 @@ class MemoryRepo:
             return None
         return v
 
-    async def set_user_display_name(self, tg_user_id: int, name: str):
-        name = (name or "").strip()
-        if not name or name.casefold() in SUSPICIOUS_NAMES:
+    async def set_user_display_name(self, tg_user_id: int, name: str | None):
+        val = (name or "").strip()
+        if not val:
+            await self.del_kv(tg_user_id, "user", "display_name")
             return
-        await self.set_kv(tg_user_id, "user", "display_name", name)
+        if val.casefold() in SUSPICIOUS_NAMES or len(val) < 2 or len(val) > 24:
+            return
+        await self.set_kv(tg_user_id, "user", "display_name", val)
 
     # ---------- USER PREFS ----------
     async def get_user_prefs(self, tg_user_id: int) -> dict:
@@ -245,3 +265,21 @@ class MemoryRepo:
         )
         row = await cur.fetchone()
         return int(row[0]) if row else 0
+
+    async def reset_turn(self, tg_user_id: int):
+        await self.del_kv(tg_user_id, "dialog", "turn")
+
+    async def remove_set_fact(self, tg_user_id: int, key: str, value: str | None = None):
+        cur = await self.get_kv(tg_user_id, "facts", key)
+        try:
+            s = set(json.loads(cur)) if cur else set()
+        except Exception:
+            s = set()
+        if value is None:
+            await self.del_kv(tg_user_id, "facts", key)
+            return
+        s.discard(value)
+        if s:
+            await self.set_kv(tg_user_id, "facts", key, json.dumps(sorted(s)))
+        else:
+            await self.del_kv(tg_user_id, "facts", key)

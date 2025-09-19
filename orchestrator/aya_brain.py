@@ -8,6 +8,8 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
+from dialogue.fact_extractor import extract_facts_generic
+from dialogue.guardrails import Guardrails
 from dialogue.extractors import extract_facts, extract_interests
 from dialogue.cadence import infer_cadence
 from dialogue.humanizer import update_user_profile, get_user_profile, maybe_snap_reply
@@ -224,12 +226,14 @@ class AyaBrain:
         BYE = ("пока", "до встречи", "бай", "споки", "спокойной ночи", "досвидания", "до свидания")
         return any(txt == w or txt.startswith(w + " ") for w in BYE)
 
-    def __init__(self, deepseek_client, memory_repo, world_state, chat_history, persona_manager):
+    def __init__(self, deepseek_client, memory_repo, world_state, chat_history, persona_manager, facts_repo=None):
         self.deepseek = deepseek_client
         self.memory = memory_repo
         self.world = world_state
         self.history = chat_history
+        self.facts = facts_repo
         self.persona = persona_manager
+        self.guardrails = Guardrails()
 
     async def health_check(self):
         return await self.deepseek.health_check()
@@ -357,7 +361,7 @@ class AyaBrain:
         adult_ok = await self.memory.get_adult_confirmed(tg_user_id)
         consent = await self.memory.get_flirt_consent(tg_user_id)
         flirt_level = await self.memory.get_flirt_level(tg_user_id)
-
+        perception = self.guardrails.perceive(user_text)
         last_intent, _, ts = await self.memory.get_dialog_state(tg_user_id)
         now = datetime.now(ZoneInfo("Europe/Moscow"))
         weather_allowed = False
@@ -377,8 +381,6 @@ class AyaBrain:
         else:
             idle_sec = None
 
-        await self.memory.touch_seen(tg_user_id)
-
         last_bot_greet_iso = await self.memory.get_last_bot_greet_at(tg_user_id)
         daily_greets = await self.memory.get_daily_greet(tg_user_id)
 
@@ -391,6 +393,32 @@ class AyaBrain:
             turn=turn,
             idle_seconds=idle_sec,
         )
+
+        # --- универсальное извлечение фактов из текущей реплики ---
+        if self.facts is not None and (user_text or "").strip():
+            try:
+                gen_facts = await extract_facts_generic(user_text, self.deepseek)
+                for f in gen_facts:
+                    # нормализуем object в строку для хранения; числа/булеан — тоже ок, приведём к str
+                    obj = f["object"]
+                    if isinstance(obj, (dict, list)):
+                        obj_str = json.dumps(obj, ensure_ascii=False)
+                    else:
+                        obj_str = str(obj)
+                    await self.facts.upsert_fact(
+                        tg_user_id,
+                        predicate=f["predicate"],
+                        obj=obj_str,
+                        dtype=f.get("dtype"),
+                        unit=f.get("unit"),
+                        confidence=float(f.get("confidence", 0.7)),
+                        source="chat",
+                        source_msg_id=None,
+                    )
+            except Exception as _e:
+                logger = globals().get("logger", None)
+                if logger:
+                    logger.debug("extract_facts_generic failed: %s", _e)
 
         # --- профиль речи пользователя (EMA) ---
         profile = await update_user_profile(self.memory, tg_user_id, user_text)
@@ -413,7 +441,7 @@ class AyaBrain:
             cad.ask = True  # дать шанс вопросу
 
         # комбинированное решение об вопросе
-        ask_flag = bool(cad.ask or getattr(plan, "ask", False))
+        ask_flag = bool(getattr(cad, "ask", False) or getattr(plan, "ask", False))
 
         # если два наших последних ответа уже были с вопросом — текущий не вопрос
         q_tail_forced = sum(1 for t in last_two_assistant_texts if (t or "").rstrip().endswith("?"))
@@ -421,7 +449,7 @@ class AyaBrain:
             ask_flag = False
 
         # сигнал для генератора: мы оживляем разговор
-        rescue_hint = 'yes' if user_ack else 'no'
+        rescue_hint = "yes" if user_ack else "no"
 
         DETAIL_RE = re.compile(r"\b(расскажи|поясни|пример|что это|как это|почему)\b", re.IGNORECASE)
         if DETAIL_RE.search(user_text or ""):
@@ -467,15 +495,10 @@ class AyaBrain:
         # --- обращение ---
         affinity = await self.memory.get_affinity(tg_user_id)
 
-        # --- адресация: подготовка формы обращения ---
-        # prefs, display_name, plan, cad, em, dialog_mode, consent, flirt_level, adult_ok, greet, weather_allowed
-        # предполагаю, что у тебя уже есть в этом месте (как в предыдущем коде).
         nickname_allowed = bool(prefs.get("nickname_allowed", False))
         nickname = (prefs.get("nickname") or "").strip() or None
         display_name_safe = (display_name or "").strip() or None
 
-
-        # affection_mode: "none" | "warm" | "romantic"
         if str(flirt_level) in ("romantic", "suggestive") or plan.tone in ("romantic", "suggestive"):
             affection_mode = "romantic"
         elif consent or plan.tone == "soft":
@@ -492,11 +515,8 @@ class AyaBrain:
             tone=(plan.tone or "off"),
         )
 
-        # общий флаг: задаём вопрос?
-        ask_flag = bool(cad.ask or getattr(plan, "ask", False))
+        # ВАЖНО: не пересчитываем ask_flag повторно после адресации
 
-        # --- BRIEF для генератора ---
-        # предполагается, что выше объявлен ask_flag = bool(cad.ask or getattr(plan, "ask", False))
         # --- BRIEF для генератора ---
         brief = (
             "REPLY_BRIEF:\n"
@@ -505,21 +525,18 @@ class AyaBrain:
             f"- ask_question={'yes' if ask_flag else 'no'}\n"
             f"- topic_focus={plan.topic}\n"
             f"- avoid_weather_numbers=true\n"
-
             "- address:\n"
             f"    nickname_allowed={'true' if nickname_allowed else 'false'}\n"
             f"    nickname='{nickname or ''}'\n"
             f"    full_name='{display_name_safe or ''}'\n"
             f"- address.use={'yes' if (should_use_address(cad.target_len, plan.tone, affinity) and address_form) else 'no'}\n"
             f"- address.form='{address_form or ''}'\n"
-
             "- variation:\n"
             f"    allow_one_word={'true' if cad.target_len == 'one' else 'false'}\n"
             f"    allow_microstory={'true' if cad.target_len in ('medium', 'long') else 'false'}\n"
             f"- imagery_cap={cad.imagery_cap}\n"
             f"- clause_cap={cad.clause_cap}\n"
             f"- formality={cad.formality}\n"
-
             f"- dialog.mood={em.label}\n"
             f"- dialog.mood_intensity={em.intensity}\n"
             f"- act={plan.act}\n"
@@ -527,39 +544,36 @@ class AyaBrain:
             f"- tone={plan.tone}\n"
             f"- emoji_mirror={'yes' if cad.emoji_mirror else 'no'}\n"
             f"- weather_allowed={'yes' if weather_allowed else 'no'}\n"
-
             f"- greeting.allow={'yes' if greet['allow'] else 'no'}\n"
             f"- greeting.kind={greet['kind']}\n"
-
             "- intimacy:\n"
             f"    adult_confirmed={'yes' if adult_ok else 'no'}\n"
             f"    flirt.consent={'yes' if consent else 'no'}\n"
             f"    flirt.level={flirt_level}\n"
             f"    dialog.mode={dialog_mode}\n"
-
             f"- rescue={rescue_hint}\n"
             "- structure:\n"
-            "    reaction=yes           # короткая эмпатия/оценка сказанного\n"
-            "    self_share=small       # один конкретный штрих/наблюдение от себя по теме\n"
-            f"    followup_question={'yes' if ask_flag else 'no'}  # открытый вопрос, если уместно\n"
-
+            "    reaction=yes\n"
+            "    self_share=small\n"
+            f"    followup_question={'yes' if ask_flag else 'no'}\n"
             "STYLE_RULES:\n"
             "- Если dialog.mode != 'roleplay': без *звёздочных* ремарок и без рассказа от третьего лица; пиши от 1-го лица.\n"
             "- Если dialog.mode == 'roleplay': ремарки *...* разрешены, 3-е лицо возможно, но без графических подробностей (fade-to-black).\n"
             "- Не начинай описание сцены/атмосферы без прямого запроса пользователя.\n"
-            "- Длина фраз преимущественно 6–14 слов; ритм вариативный, без «простыней».\n"
+            "- Длина фраз преимущественно 6–14 слов; ритм вариативный.\n"
             "- Если ask_question=no — не инициируй вопросов и просьб «поделиться/прислать».\n"
             "- Вопрос в конце — только если ask_question=yes.\n"
-            "- Держись текущего настроения собеседника (dialog.mood); при sad/anxiety/tired — поддержка, мягкие уточнения, без резких смен тем.\n"
-            "- Избегай штампов и канцелярита; максимум одна образная фраза в ответе.\n"
-            "- Адресация: если nickname_allowed=true и задан nickname — используй его; иначе полное имя; без прозвищ.\n"
+            "- Держись текущего настроения собеседника (dialog.mood); при sad/anxiety/tired — поддержка, мягкие уточнения.\n"
+            "- Избегай штампов и канцелярита; максимум одна образная фраза.\n"
+            "- Адресация: если nickname_allowed=true и задан nickname — используй его; иначе полное имя.\n"
+            "- Не используй скобочные ремарки типа '(смеётся)' — вместо этого поставь уместный эмодзи.\n"
+            "- Если нет явного согласия на флирт — не предлагай «мягко/нежно/романтично продолжить».\n"
 
             "CONTENT_HOOKS:\n"
-            "- Если пользователь делится опытом/достижением — отзеркаль эмоцию, добавь крошку личного опыта и спроси уместную деталь.\n"
-            "- Если weather_allowed=no — вообще не упоминай погоду/дождь/ветер; числа о погоде — только по прямому запросу.\n"
-            "- Соблюдай границы интимности и согласие; не поднимай уровень без явного сигнала.\n"
+            "- Если пользователь делится опытом — отзеркаль эмоцию, добавь крошку личного опыта и спроси деталь.\n"
+            "- Если weather_allowed=no — вообще не упоминай погоду/дождь/ветер.\n"
+            "- Соблюдай границы интимности и согласие; не поднимай уровень без сигнала.\n"
             "- Пользуйся только USER_FACTS; не приписывай пользователю мои слова.\n"
-            "- Задавай конкретный, контекстный вопрос (не «расскажи подробнее»); привязывайся к словам пользователя: что именно? какой? когда в последний раз? зачем?\n"
             "- Избегай односложных ответов; даже в short дай 1–2 информативные детали.\n"
         )
 
@@ -588,14 +602,14 @@ class AyaBrain:
         # критик: если слишком «ИИшно», пробуем plain-fallback
         if ai_score(raw_content) >= 6:
             fallback_brief = (
-                brief
-                + "\nFORCE_PLAIN:\n"
-                  "- style.length=medium\n"
-                  "- ask_question=yes\n"
-                  "- imagery_cap=0\n"
-                  "- clause_cap=1\n"
-                  "- formality=plain\n"
-                  "- avoid_scene_openers=yes\n"
+                    brief
+                    + "\nFORCE_PLAIN:\n"
+                      "- style.length=medium\n"
+                      "- ask_question=yes\n"
+                      "- imagery_cap=0\n"
+                      "- clause_cap=1\n"
+                      "- formality=plain\n"
+                      "- avoid_scene_openers=yes\n"
             )
             messages_plain = [
                 {"role": "system", "content": system_prompt},
@@ -616,16 +630,13 @@ class AyaBrain:
             content = "Я здесь 🙂"
 
         # --- пост-стилистический санитайзер ---
-        content = post_style_sanitizer(
+        content = self.guardrails.postprocess(
             content,
             mode=decision.mode,
-            ask_flag=ask_flag,  # ← заменить
-            history=history,
-            imagery_cap=cad.imagery_cap,
-            clause_cap=cad.clause_cap,
+            user_consent=bool(consent),
         )
 
-        # Avoid premature closers: не «закрываем» разговор сами, если пользователь не прощался
+        # Avoid premature closers
         if not self._goodbye_policy(user_text):
             content = re.sub(
                 r"(?:^|\s)(?:Ладно|Окей|Хорошо),\s*(?:я|пойду|вернусь|возвращаюсь)[^.]*\.",
@@ -664,5 +675,6 @@ class AyaBrain:
 
         log.info(f"[content_router] mode={decision.mode.value} reason={decision.reason}")
         return content
+
 
 

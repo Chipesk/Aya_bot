@@ -5,6 +5,10 @@ class ChatHistoryRepo:
     def __init__(self, db):
         self.db = db
 
+    async def clear(self, tg_user_id: int):
+        await self.db.conn.execute("DELETE FROM messages WHERE tg_user_id=?", (tg_user_id,))
+        await self.db.conn.commit()
+
     async def add(self, tg_user_id: int, role: str, content: str):
         await self.db.conn.execute(
             "INSERT INTO messages (tg_user_id, role, content) VALUES (?, ?, ?)",

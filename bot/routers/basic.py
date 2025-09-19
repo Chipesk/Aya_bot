@@ -51,10 +51,8 @@ def is_time_question(text: str) -> bool:
         return False
     if NEG_FREE_TIME_RE.search(text):
         return False
-    # короткие прямые вопросы типа «который час?» «сколько времени?»
     if len(text) <= 40 and ASK_TIME_RE.search(text):
         return True
-    # явные формулировки
     return bool(re.search(r"^(который\s+час|сколько\s+(?:сейчас\s+)?времени)\b", text.strip(), re.IGNORECASE))
 
 # ====== Хелперы ======
@@ -75,9 +73,7 @@ def _is_bad_nick(nick: str) -> bool:
         return True
     if s in BAD_FORMS:
         return True
-    # можно дополнить: запрет emoji/знаков
     return False
-
 
 def suggest_nick(display_name: str) -> list[str]:
     mapping = {
@@ -106,9 +102,7 @@ def suggest_nick(display_name: str) -> list[str]:
         "Карина": ["Кариша"],
     }
     opts = mapping.get(display_name, [])
-    # фильтр на всякий случай
     return [o for o in opts if o.strip().lower() not in BAD_FORMS]
-
 
 def human_weather(world: dict) -> str:
     w = world.get("weather", {}) or {}
@@ -159,32 +153,54 @@ async def cmd_start(message: types.Message, aya_brain, memory_repo):
     # Полный сброс состояния (история, тема, ласковость, имя/ник, приветы)
     await aya_brain.reset_user(tg_user_id)
 
-    # Начинаем знакомство всегда одинаково, без проверок last_greet_iso/имени
+    # Начинаем знакомство одинаково
     text = "Привет! Я Ая. Давай знакомиться. Как тебя зовут?"
     await message.reply(text)
 
-    # Заодно пометим «привет» текущим временем, чтобы статистика была консистентной
+    # Помечаем «привет» и открываем короткое окно для ввода имени одним словом
     now = datetime.now(ZoneInfo("Europe/Moscow"))
     await memory_repo.set_last_bot_greet_at(tg_user_id, now.isoformat(timespec="seconds"))
     await memory_repo.inc_daily_greet(tg_user_id, now.strftime("%Y%m%d"))
-
-    # Имя
-    name = extract_name(text)
-    if name:
-        await memory_repo.set_user_display_name(tg_user_id, name)
-        await message.answer(f"Приятно, {name}! Запомнила 😊")
-        await memory_repo.clear_dialog_state(tg_user_id)
-        return
-
+    # включаем режим ожидания имени
+    await memory_repo.set_dialog_state(tg_user_id, "name_context", "")
 
 @router.message(Command("help"))
 async def help_cmd(message: types.Message):
     await message.reply("Я рядом: поболтать, поддержать, придумать планы. Скажи «меня зовут …», чтобы я обращалась по имени.")
 
 @router.message(Command("health"))
-async def health(message: types.Message, aya_brain):
-    ok, msg = await aya_brain.health_check()
-    await message.answer(f"DeepSeek auth: {'OK' if ok else 'FAIL'} — {msg}")
+async def health(message: types.Message):
+    # Проверяем и БД, и LLM (ожидается, что в main.py положены bot['db'] и bot['deepseek'])
+    db = message.bot.get("db")
+    deepseek = message.bot.get("deepseek")
+
+    ok_db = False
+    db_err = None
+    if db is not None:
+        try:
+            cur = await db.conn.execute("SELECT 1")
+            await cur.fetchone()
+            ok_db = True
+        except Exception as e:
+            db_err = str(e)
+
+    ok_ai = False
+    ai_note = "n/a"
+    if deepseek is not None:
+        try:
+            ok_ai, ai_note = await deepseek.health_check()
+        except Exception as e:
+            ai_note = f"error: {e}"
+
+    status = "OK" if (ok_db and ok_ai) else ("DEGRADED" if (ok_db or ok_ai) else "FAIL")
+    lines = [
+        f"status: {status}",
+        f"db: {'ok' if ok_db else 'fail'}",
+        f"llm: {'ok' if ok_ai else 'fail'} ({ai_note})",
+    ]
+    if not ok_db and db_err:
+        lines.append(f"db_error: {db_err}")
+    await message.answer("\n".join(lines))
 
 @router.message(Command("flirt"))
 async def flirt_info(message: types.Message, memory_repo, tg_user_id: int):
@@ -209,7 +225,7 @@ async def debug_world(message: types.Message, world_state):
 
 # ====== ЕДИНСТВЕННЫЙ общий хендлер текста ======
 @router.message(F.text)
-async def free_chat(message: types.Message, tg_user_id: int, aya_brain, memory_repo, world_state, chat_history):
+async def free_chat(message: types.Message, tg_user_id: int, aya_brain, memory_repo, world_state, chat_history, facts_repo):
     text = (message.text or "").strip()
     await memory_repo.touch_seen(tg_user_id)
 
@@ -223,13 +239,11 @@ async def free_chat(message: types.Message, tg_user_id: int, aya_brain, memory_r
     fi = detect_flirt_intent(text)
     if fi:
         reply = await apply_flirt_state(memory_repo, tg_user_id, fi)
-        # если apply_flirt_state вернул готовый короткий ответ — отдадим его и завершим ход
         if reply:
             await message.answer(reply)
             return
-        # иначе продолжаем обычную логику (LLM увидит обновлённые флаги в памяти)
 
-    # свеж ли контекст ника?
+    # свеж ли контекст ника/имени?
     is_fresh = False
     if ts:
         try:
@@ -239,36 +253,72 @@ async def free_chat(message: types.Message, tg_user_id: int, aya_brain, memory_r
 
     # --- «что ты помнишь обо мне?» — отвечаем из памяти, не через LLM
     if ASK_REMEMBER_RE.search(text):
+        # топ фактов из универсального хранилища
+        top = await facts_repo.top_facts(tg_user_id, limit=12)
+
+        # плюс совместимость со старым KV (имя/ник и т.п.)
         name = await memory_repo.get_user_display_name(tg_user_id)
         prefs = await memory_repo.get_user_prefs(tg_user_id)
-        artists = await memory_repo.get_set_fact(tg_user_id, "music_artists")
-        astro = await memory_repo.get_kv(tg_user_id, "facts", "astronomy")
-        loc = await memory_repo.get_kv(tg_user_id, "facts", "location_hint")
-        quiet = await memory_repo.get_kv(tg_user_id, "facts", "likes_quiet")
 
-        parts = []
-        if name: parts.append(f"тебя зовут {name}")
-        if prefs.get("nickname"): parts.append(f"можно звать «{prefs['nickname']}»")
-        if artists: parts.append(f"любишь {', '.join(artists[:3])}{'…' if len(artists)>3 else ''}")
-        if astro == "1": parts.append("интересуешься астрономией")
-        if loc: parts.append(f"живёшь рядом с {loc}")
-        if quiet == "1": parts.append("любишь тишину")
+        lines = []
+        if name:
+            lines.append(f"тебя зовут {name}")
+        if prefs.get("nickname"):
+            lines.append(f"можно звать «{prefs['nickname']}»")
+
+        # человекочитаемая сборка предикатов
+        for it in top:
+            p = it["predicate"];
+            o = it["object"];
+            dt = (it.get("dtype") or "str")
+            if p == "age" and dt in ("int", "str"):
+                lines.append(f"тебе {o}")
+            elif p in ("job_title", "role"):
+                lines.append(f"роль: {o}")
+            elif p in ("company", "employer"):
+                lines.append(f"компания: {o}")
+            elif p in ("industry", "domain"):
+                lines.append(f"сфера: {o}")
+            elif p.startswith("favorite_"):
+                pretty = p.replace("favorite_", "любимое ").replace("_", " ")
+                lines.append(f"{pretty}: {o}")
+            elif p in ("city", "location", "district"):
+                lines.append(f"локация: {o}")
+            elif p in ("hobby", "hobbies"):
+                lines.append(f"увлечения: {o}")
+            elif p in ("pet", "has_pet", "pet_name"):
+                lines.append(f"питомцы: {o}")
+            elif p in ("car_model", "bike_model"):
+                lines.append(f"транспорт: {o}")
+            elif p in ("adult",):
+                # не проговариваем явно; можно использовать для фильтров
+                continue
+            else:
+                # дефолтно показываем как «факт: значение»
+                pretty = p.replace("_", " ")
+                lines.append(f"{pretty}: {o}")
 
         text_out = (
-            "Я запомнила: " + "; ".join(parts) + "."
-            if parts else
-            "Пока главное — твоё имя. Можешь рассказать ещё пару вещей, и я сохраню."
+            "Я запомнила: " + "; ".join(dict.fromkeys(lines)) + "."
+            if lines else
+            "Пока точно помню твоё имя. Можешь рассказать, чем занимаешься, возраст, увлечения — я сохраню."
         )
         await message.answer(text_out)
         return
 
-
-    # Имя
+    # Имя из фразы «меня зовут …»
     name = extract_name(text)
     if name:
         await memory_repo.set_user_display_name(tg_user_id, name)
         await message.answer(f"Приятно, {name}! Запомнила 😊")
         await memory_repo.clear_dialog_state(tg_user_id)
+        return
+
+    # Если мы только что попросили имя (/start → name_context) и пришло одно слово — считаем его именем
+    if intent == "name_context" and is_fresh and re.fullmatch(r"[A-Za-zА-Яа-яЁё\-]{2,20}", text):
+        await memory_repo.set_user_display_name(tg_user_id, text.strip().title())
+        await memory_repo.clear_dialog_state(tg_user_id)
+        await message.answer(f"Приятно, {text.strip().title()}! Запомнила 😊")
         return
 
     # Ласковость
@@ -317,8 +367,7 @@ async def free_chat(message: types.Message, tg_user_id: int, aya_brain, memory_r
     if m_nick:
         nick = m_nick.group(2).strip()
         if _is_bad_nick(nick):
-            await message.answer(
-                "Так не очень звучит. Напиши, пожалуйста, как тебе комфортно, например «зови меня Лёша».")
+            await message.answer("Так не очень звучит. Напиши, пожалуйста, как тебе комфортно, например «зови меня Лёша».")
             return
         await memory_repo.set_user_nickname_allowed(tg_user_id, True)
         await memory_repo.set_user_nickname(tg_user_id, nick)
@@ -335,6 +384,9 @@ async def free_chat(message: types.Message, tg_user_id: int, aya_brain, memory_r
             m_ind = NICK_INDIRECT_SET_RE.search(text)
             if m_ind:
                 nick = m_ind.group(1).strip()
+                if _is_bad_nick(nick):
+                    await message.answer("Поняла. Лучше что-то нейтральное и без просторечий.")
+                    return
                 await memory_repo.set_user_nickname_allowed(tg_user_id, True)
                 await memory_repo.set_user_nickname(tg_user_id, nick)
                 await memory_repo.clear_dialog_state(tg_user_id)
@@ -374,26 +426,38 @@ async def free_chat(message: types.Message, tg_user_id: int, aya_brain, memory_r
     # Факты (детерминированно)
     if ASK_DATETIME_BOTH_RE.search(text):
         now = datetime.now(ZoneInfo("Europe/Moscow"))
+        out = now.strftime("Сейчас %H:%M, сегодня %d.%m.%Y")
         await memory_repo.clear_dialog_state(tg_user_id)
-        await message.answer(now.strftime("Сейчас %H:%M, сегодня %d.%m.%Y"))
+        await chat_history.add(tg_user_id, "user", text)
+        await chat_history.add(tg_user_id, "assistant", out)
+        await message.answer(out)
         return
 
     if ASK_DATE_RE.search(text):
         now = datetime.now(ZoneInfo("Europe/Moscow"))
+        out = now.strftime("Сегодня %d.%m.%Y")
         await memory_repo.clear_dialog_state(tg_user_id)
-        await message.answer(now.strftime("Сегодня %d.%m.%Y"))
+        await chat_history.add(tg_user_id, "user", text)
+        await chat_history.add(tg_user_id, "assistant", out)
+        await message.answer(out)
         return
 
-    if is_time_question(text):
+    if ASK_TIME_RE.search(text):
         now = datetime.now(ZoneInfo("Europe/Moscow"))
+        out = now.strftime("Сейчас %H:%M")
         await memory_repo.clear_dialog_state(tg_user_id)
-        await message.answer(now.strftime("Сейчас %H:%M"))
+        await chat_history.add(tg_user_id, "user", text)
+        await chat_history.add(tg_user_id, "assistant", out)
+        await message.answer(out)
         return
 
     if ASK_WEATHER_RE.search(text):
         ctx = await world_state.get_context()
+        out = f"В Питере сейчас {human_weather(ctx)}."
         await memory_repo.set_dialog_state(tg_user_id, "weather", "")
-        await message.answer(f"В Питере сейчас {human_weather(ctx)}.")
+        await chat_history.add(tg_user_id, "user", text)
+        await chat_history.add(tg_user_id, "assistant", out)
+        await message.answer(out)
         return
 
     # Темы
