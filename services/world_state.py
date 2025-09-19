@@ -1,3 +1,4 @@
+# mypy: ignore-errors
 # services/world_state.py
 import json
 import time

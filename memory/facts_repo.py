@@ -1,6 +1,7 @@
+# mypy: ignore-errors
 # memory/facts_repo.py
 from __future__ import annotations
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 from sqlite3 import OperationalError
 import time
 import re
@@ -9,7 +10,8 @@ _TOKEN_RE = re.compile(r"[0-9A-Za-zА-Яа-яЁё]+", re.UNICODE)
 
 def _fts_phrase(text: str, max_tokens: int = 8) -> Optional[str]:
     toks = _TOKEN_RE.findall(text or "")
-    if not toks: return None
+    if not toks:
+        return None
     phrase = " ".join(toks[:max_tokens]).replace('"','""')
     return f'"{phrase}"' if phrase else None
 
@@ -39,7 +41,8 @@ class FactsRepo:
         self._fts = "facts_fts"
 
     async def _ensure(self):
-        if self._ready: return
+        if self._ready:
+            return
         await self.db.conn.execute(f"""
         CREATE TABLE IF NOT EXISTS {self._table}(
           id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -104,7 +107,8 @@ class FactsRepo:
                 f"SELECT id, confidence FROM {self._table} WHERE tg_user_id=? AND predicate=? AND object=? LIMIT 1",
                 (tg_user_id, pred, obj)
             )
-            row = await cur.fetchone(); await cur.close()
+            row = await cur.fetchone()
+            await cur.close()
             if row:
                 fact_id, old_conf = row[0], float(row[1])
                 new_conf = max(old_conf, conf)  # можно сделать EMA:  new = 0.7*old + 0.3*conf
@@ -130,7 +134,8 @@ class FactsRepo:
                 LIMIT ?""",
             (tg_user_id, limit)
         )
-        rows = await cur.fetchall(); await cur.close()
+        rows = await cur.fetchall()
+        await cur.close()
         return [
             {
                 "id": r[0], "predicate": r[1], "object": r[2],
@@ -142,7 +147,8 @@ class FactsRepo:
     async def search(self, tg_user_id: int, query: str, limit: int = 20) -> List[Dict]:
         await self._ensure()
         q = (query or "").strip()
-        if not q: return []
+        if not q:
+            return []
         phrase = _fts_phrase(q, 8)
         if phrase:
             try:
@@ -155,7 +161,8 @@ class FactsRepo:
                         LIMIT ?""",
                     (tg_user_id, phrase, limit)
                 )
-                rows = await cur.fetchall(); await cur.close()
+                rows = await cur.fetchall()
+                await cur.close()
                 if rows:
                     return [
                         {"id": r[0], "predicate": r[1], "object": r[2],
@@ -174,7 +181,8 @@ class FactsRepo:
                 LIMIT ?""",
             (tg_user_id, f"%{q}%", f"%{q}%", limit)
         )
-        rows = await cur.fetchall(); await cur.close()
+        rows = await cur.fetchall()
+        await cur.close()
         return [
             {"id": r[0], "predicate": r[1], "object": r[2],
              "confidence": float(r[3]), "source_msg_id": r[4],

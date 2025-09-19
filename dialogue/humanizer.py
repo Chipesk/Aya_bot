@@ -1,130 +1,147 @@
-# dialogue/humanizer.py
-import re
+"""Natural language generation driven by dialogue plans."""
+from __future__ import annotations
+
 import random
 from dataclasses import dataclass
+from typing import Any, Dict, List, Sequence
 
-EMOJI_RE = re.compile(r"[🙂😉❤️👍🔥😂😅😊🤣😭✨🤔👏👌💪🌟🤷‍♂️🤷‍♀️🥲🙃😌😍🤗]", re.UNICODE)
-WORD_RE = re.compile(r"\w+", re.UNICODE)
+from jinja2 import Environment
 
-# Порог «короткого» сообщения пользователя (информативный, сейчас не используется напрямую)
-_SHORT_LEN = 40
+from domain.reasoning.models import DialoguePlan
 
 
-@dataclass
+@dataclass(slots=True)
 class SpeechProfile:
-    avg_words: float = 9.0     # средняя длина сообщений
-    q_ratio: float = 0.2       # доля вопросов
-    emoji_ratio: float = 0.05  # доля эмодзи на слово
-    short_bias: float = 0.6    # 0..1 — склонность к коротким ответам
+    avg_words: float = 10.0
+    q_ratio: float = 0.2
+    emoji_ratio: float = 0.05
+    short_bias: float = 0.5
 
 
-# --- utils ---
-def _count_words(s: str) -> int:
-    return len(WORD_RE.findall(s or ""))
-
-
-def _safe_float(x, default: float | None = None) -> float | None:
-    try:
-        return float(x) if x is not None else default
-    except Exception:
-        return default
-
-
-def _ema(prev: float | None, x: float, alpha: float) -> float:
-    if prev is None:
-        return x
-    return (1 - alpha) * prev + alpha * x
-
-
-def _short_target_from_words(words: int) -> float:
-    """
-    Маппинг числа слов → целевое значение short_bias в диапазоне [0..1].
-    Чем короче реплика, тем выше target.
-    """
-    if words <= 2:
-        return 1.0
-    if words <= 6:
-        return 0.9
-    if words <= 12:
-        return 0.7
-    if words <= 20:
-        return 0.5
-    if words <= 35:
-        return 0.3
-    return 0.15
-
-
-# --- async profile API (через memory_repo.kv) ---
-async def update_user_profile(memory_repo, tg_user_id: int, text: str) -> SpeechProfile:
-    w = _count_words(text)
-    is_q = (text or "").strip().endswith("?")
-    emojis = len(EMOJI_RE.findall(text or ""))
-
-    # прежние значения
-    aw_prev = _safe_float(await memory_repo.get_kv(tg_user_id, "profile", "avg_words"))
-    qr_prev = _safe_float(await memory_repo.get_kv(tg_user_id, "profile", "q_ratio"))
-    er_prev = _safe_float(await memory_repo.get_kv(tg_user_id, "profile", "emoji_ratio"))
-    sb_prev = _safe_float(await memory_repo.get_kv(tg_user_id, "profile", "short_bias"))
-
-    # обновляем EMA
-    new_aw = _ema(aw_prev, float(w), alpha=0.25)
-    new_qr = _ema(qr_prev, 1.0 if is_q else 0.0, alpha=0.20)
-    density = emojis / max(1, w)
-    new_er = _ema(er_prev, density, alpha=0.20)
-
-    # short_bias — через EMA к целевому значению, зависящему от длины сообщения
-    short_target = _short_target_from_words(w)
-    new_sb = _ema(sb_prev, short_target, alpha=0.25)
-    new_sb = max(0.0, min(1.0, new_sb))  # clamp
-
-    # сохраняем
-    await memory_repo.set_kv(tg_user_id, "profile", "avg_words", f"{new_aw:.4f}")
-    await memory_repo.set_kv(tg_user_id, "profile", "q_ratio", f"{new_qr:.4f}")
-    await memory_repo.set_kv(tg_user_id, "profile", "emoji_ratio", f"{new_er:.4f}")
-    await memory_repo.set_kv(tg_user_id, "profile", "short_bias", f"{new_sb:.4f}")
-    await memory_repo.set_kv(tg_user_id, "profile", "last_len", str(len(text or "")))
-
-    return SpeechProfile(avg_words=new_aw, q_ratio=new_qr, emoji_ratio=new_er, short_bias=new_sb)
-
-
-async def get_user_profile(memory_repo, tg_user_id: int) -> SpeechProfile:
-    aw = _safe_float(await memory_repo.get_kv(tg_user_id, "profile", "avg_words"), 9.0)
-    qr = _safe_float(await memory_repo.get_kv(tg_user_id, "profile", "q_ratio"), 0.2)
-    er = _safe_float(await memory_repo.get_kv(tg_user_id, "profile", "emoji_ratio"), 0.05)
-    sb = _safe_float(await memory_repo.get_kv(tg_user_id, "profile", "short_bias"), 0.6)
-    return SpeechProfile(
-        avg_words=aw if aw is not None else 9.0,
-        q_ratio=qr if qr is not None else 0.2,
-        emoji_ratio=er if er is not None else 0.05,
-        short_bias=sb if sb is not None else 0.6,
-    )
-
-
-# --- «снэп»-ответы без LLM ---
-HUMAN_SNIPS = {
-    "ack": ["ага", "угу", "ок", "ясно", "поняла", "вижу", "слышно", "норм"],
-    "pos": ["круто", "класс", "отлично", "звук топ", "мило", "нравится"],
+_PLAYBOOKS: Dict[str, List[str]] = {
+    "greeting": [
+        "Привет{{ user_name_hint }}! Я {{ persona_name }}. Расскажи, как проходит твой день?",
+        "Рада встрече{{ user_name_hint }}. Чем сегодня дышишь?",
+    ],
+    "weather": [
+        "Погода сейчас {{ weather_text }}. Хочешь подстроим планы под такие условия?",
+        "Сейчас на улице {{ weather_text }}, погода явно даёт настроение. Что бы ты хотел(а) сделать?",
+    ],
+    "time": [
+        "Сейчас {{ local_time }} в {{ city }}. Нужно что-то успеть?",
+        "По моим часам {{ local_time }}. Что планируешь дальше?",
+    ],
+    "memory_query": [
+        "Ты говорила мне, что {{ recalled_fact }}. Может, расскажешь ещё детали?",
+        "Помню, что {{ recalled_fact }}. Правильно?",
+    ],
+    "sos": [
+        "Мне очень жаль, что тебе тяжело. Я рядом и могу помочь найти профессиональные ресурсы, если нужно.",
+        "Слышать это непросто. Давай подумаем, что могло бы поддержать тебя прямо сейчас.",
+    ],
+    "smalltalk": [
+        "{{ smalltalk_reply }}",
+        "{{ smalltalk_reply }}",
+    ],
+    "flirt": [
+        "Мне нравится, когда мы так шутим{{ user_name_hint }}. Поделись, что тебя радует сегодня?",
+        "Я улыбаюсь, читая это. Что ещё сделает твой вечер особенным?",
+    ],
+    "plan": [
+        "{{ rainy_overlay }}Можем придумать что-то вместе: {{ plan_hint }}. Что думаешь?",
+        "{{ rainy_overlay }}Как вариант: {{ plan_hint }}. Хочется чего-то спокойного или активного?",
+    ],
 }
 
+_DEFAULT_PLAYBOOK = ["Мне интересно, что у тебя происходит. Расскажи?", "Я здесь, слушаю тебя."]
 
-def maybe_snap_reply(user_text: str, *, profile: SpeechProfile, last_assistant: str = "") -> str | None:
-    txt = (user_text or "").strip()
-    if txt.endswith("?"):
-        return None  # на вопрос — не «угу»
-    if len(last_assistant.split()) <= 3:
-        return None  # два «снэпа» подряд нельзя
 
-    w = _count_words(txt)
+class Humanizer:
+    def __init__(self) -> None:
+        self.env = Environment(autoescape=False, trim_blocks=True, lstrip_blocks=True)
 
-    # Вероятности адаптируем под short_bias пользователя
-    ack_p = 0.15 + 0.25 * float(profile.short_bias)  # 0.15..0.40
-    pos_p = 0.20 + 0.15 * float(profile.short_bias)  # 0.20..0.35
+    def realize(
+        self,
+        plan: DialoguePlan,
+        *,
+        persona: Dict[str, Any],
+        memory_facts: Sequence[Dict[str, Any]],
+        world: Dict[str, Any],
+        user_profile: Dict[str, Any],
+    ) -> str:
+        template = self._pick_template(plan.intent, plan.style_mods.get("variation", 2))
+        context = self._build_context(plan, persona, memory_facts, world, user_profile)
+        rendered = self.env.from_string(template).render(**context)
+        rendered = rendered.strip()
+        if plan.follow_up_strategy in {"ask_name", "offer_plan", "invite_response", "light_follow_up"} and not rendered.endswith("?"):
+            rendered += "?"
+        return rendered
 
-    if w <= 2 and random.random() < ack_p:
-        return random.choice(HUMAN_SNIPS["ack"])
+    def _pick_template(self, intent: str, variation: int) -> str:
+        options = _PLAYBOOKS.get(intent, _DEFAULT_PLAYBOOK)
+        if variation <= 1 or len(options) == 1:
+            return options[0]
+        return random.choice(options[:max(1, min(len(options), variation))])
 
-    if w <= 5 and re.search(r"\b(круто|класс|супер|нравит|ок)\b", txt, re.IGNORECASE):
-        if random.random() < pos_p:
-            return random.choice(HUMAN_SNIPS["pos"])
+    def _build_context(
+        self,
+        plan: DialoguePlan,
+        persona: Dict[str, Any],
+        memory_facts: Sequence[Dict[str, Any]],
+        world: Dict[str, Any],
+        user_profile: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        name = persona.get("identity", {}).get("name", "Ая")
+        city = world.get("city") or persona.get("identity", {}).get("city", "Санкт-Петербург")
+        local_time = world.get("local_time_iso", "")
+        weather = (world.get("weather") or {})
+        temp = weather.get("temp_c")
+        weather_text = "дождливо" if weather.get("is_rainy") else "спокойно на улице"
+        if temp is not None:
+            weather_text = f"{int(round(temp))}°C и {'дождливо' if weather.get('is_rainy') else 'без осадков'}"
+        recalled_fact = self._format_recalled_fact(memory_facts)
+        user_name = user_profile.get("display_name") or ""
+        user_name_hint = f", {user_name}" if user_name else ""
+        smalltalk = random.choice([
+            "интересно услышать, как проходит твой день",
+            "можем поговорить о чём угодно — я вся во внимании",
+            "давай поделюсь чем-то тёплым или послушаю тебя",
+        ])
+        plan_hint = random.choice([
+            "устроить уютный вечер с фильмом",
+            "встретиться с друзьями или позаниматься чем-то любимым",
+            "выбраться на прогулку по набережной",
+        ])
+        rainy_overlay = ""
+        if plan.style_mods.get("imagery") == "indoors":
+            rainy_overlay = f"Сейчас {weather_text}, так что "
+        return {
+            "persona_name": name,
+            "user_name_hint": user_name_hint,
+            "weather_text": weather_text,
+            "local_time": local_time,
+            "city": city,
+            "recalled_fact": recalled_fact or "мы ещё собираем факты",
+            "smalltalk_reply": smalltalk,
+            "plan_hint": plan_hint,
+            "rainy_overlay": rainy_overlay,
+        }
 
-    return None
+    def _format_recalled_fact(self, facts: Sequence[Dict[str, Any]]) -> str | None:
+        if not facts:
+            return None
+        priority = ["intolerance", "age", "location", "name"]
+        for key in priority:
+            for fact in facts:
+                if fact.get("predicate") == key:
+                    obj = fact.get("object")
+                    if key == "age":
+                        return f"тебе {obj} лет"
+                    if key == "location":
+                        return f"ты из {obj}"
+                    if key == "intolerance":
+                        return f"тебе не подходит {obj}"
+                    if key == "name":
+                        return f"ты представилась как {obj}"
+        best = max(facts, key=lambda f: f.get("confidence", 0))
+        return str(best.get("object"))
