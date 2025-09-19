@@ -1,0 +1,26 @@
+[project]
+name = "aya-bot"
+version = "0.1.0"
+requires-python = ">=3.12"
+dependencies = []
+
+[tool.black]
+line-length = 100
+
+[tool.isort]
+profile = "black"
+
+[tool.ruff]
+line-length = 100
+src = ["."]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+ignore_missing_imports = true
+explicit_package_bases = true
+namespace_packages = true
+plugins = []
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"

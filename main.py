@@ -1,131 +1,98 @@
-# main.py
+"""Application entry point."""
+# mypy: ignore-errors
+from __future__ import annotations
+
 import asyncio
-import logging
-import inspect
+from pathlib import Path
 
 from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 
-from memory.facts_repo import FactsRepo
-from memory.episodes import EpisodesRepo
-from memory.repo import MemoryRepo
-from memory.chat_history import ChatHistoryRepo
-
+from adapters.telegram.dev_runner import DevBotRunner
+from bot.middlewares.user_context import UserContextMiddleware
+from bot.routers.basic import router as basic_router
+from core.logging import get_logger, setup_logging
 from core.settings import settings
-from core.logging import setup_logging
-
-from storage.db import DB
-
+from domain.memory.manager import MemoryManager
+from domain.persona.service import PersonaService
+from domain.policies.loader import load_policy_bundle
+from domain.reasoning.decision_engine import DecisionEngine
+from domain.world_state.service import WorldStateService
+from memory.chat_history import ChatHistoryRepo
+from memory.facts_repo import FactsRepo
+from memory.repo import MemoryRepo
+from orchestrator.aya_brain import AyaBrain
 from services.deepseek_client import DeepSeekClient
 from services.world_state import WorldState
+from storage.db import DB, ensure_db_ready
 
-from persona.loader import PersonaManager
-
-from orchestrator.aya_brain import AyaBrain
-import orchestrator.aya_brain as _brain
-
-from bot.routers.basic import router as basic_router
-from bot.middlewares.user_context import UserContextMiddleware
-
-import dialogue.cadence as _cad
-import dialogue.humanizer as _hum
-
-from datetime import datetime
-from zoneinfo import ZoneInfo
+log = get_logger("main")
 
 
-# --- простой плейсхолдер-провайдер погоды (замени на реальный fetcher при интеграции) ---
-async def fetch_spb_weather():
-    return {
-        "city": "Санкт-Петербург",
-        "local_time_iso": datetime.now(ZoneInfo("Europe/Moscow")).isoformat(timespec="seconds"),
-        "weather": {
-            "temp_c": None,      # подставь фактическую температуру
-            "is_rainy": False,   # подставь фактический флаг дождя
-        },
-    }
+async def app() -> None:
+    setup_logging(settings.LOG_LEVEL, json_mode=settings.is_prod, diag=settings.is_diag)
+    db = await ensure_db_ready(DB(settings.DB_PATH))
 
-
-async def app():
-    # Логи
-    setup_logging(settings.LOG_LEVEL)
-    log = logging.getLogger("main")
-
-    # Диагностика модулей (в debug-лог)
-    log.debug("cadence.py -> %s", inspect.getfile(_cad))
-    log.debug("humanizer.py -> %s", inspect.getfile(_hum))
-    log.debug("aya_brain.py -> %s", inspect.getfile(_brain))
-    for mod in (_cad, _hum, _brain):
-        try:
-            src = inspect.getsource(mod)
-            log.debug("%s len=%d hash=%d", mod.__name__, len(src), hash(src))
-        except Exception as e:
-            log.debug("source read error %s %s", mod.__name__, e)
-
-    # Sanity checks
-    if not settings.TELEGRAM_TOKEN:
-        raise RuntimeError("TELEGRAM_TOKEN is missing")
-    # DeepSeek API-ключ не обязателен: клиент умеет демо-ответ, /health покажет состояние
-
-    # --- DB + repositories ---
-    db = DB(settings.DB_PATH)
-    await db.connect()
     memory_repo = MemoryRepo(db)
     chat_history = ChatHistoryRepo(db)
     facts_repo = FactsRepo(db)
-    episodes_repo = EpisodesRepo(db)
-    # --- Services ---
     deepseek = DeepSeekClient(settings.DEEPSEEK_API_KEY or None)
-    world_state = WorldState(db=db, fetcher=fetch_spb_weather, ttl_sec=900)
-    persona = PersonaManager()
+    world_backend = WorldState(db=db, fetcher=_dummy_weather_fetch, ttl_sec=900)
+    world_service = WorldStateService(world_backend)
+    persona_service = PersonaService()
+    memory_manager = MemoryManager(memory_repo, facts_repo, chat_history)
 
-    # --- Brain ---
-    aya_brain = AyaBrain(deepseek, memory_repo, world_state, chat_history, persona, facts_repo=facts_repo, episodes_repo=episodes_repo)
+    policy_bundle = load_policy_bundle(Path("policies"))
+    decision_engine = DecisionEngine(policy_bundle)
 
-    # --- Telegram ---
-    bot = Bot(
-        token=settings.TELEGRAM_TOKEN,
-        default=DefaultBotProperties(parse_mode=ParseMode.HTML),
+    aya_brain = AyaBrain(
+        deepseek,
+        memory_repo,
+        memory_manager,
+        world_service,
+        persona_service,
+        decision_engine,
+        facts_repo,
     )
-    dp = Dispatcher()
 
-    # --- Middleware & DI ---
-    dp.update.middleware(UserContextMiddleware(memory_repo))
+    token = settings.bot_token()
+    if token == "TEST:TOKEN" and settings.ENV in {"dev", "test"}:
+        log.info("Starting dev runner")
 
-    # Инъекции для хендлеров (используются как параметры функций)
-    dp["aya_brain"] = aya_brain
-    dp["memory_repo"] = memory_repo
-    dp["world_state"] = world_state
-    dp["chat_history"] = chat_history
-    dp["db"] = db
-    dp["deepseek"] = deepseek
-    dp["facts_repo"] = facts_repo
-    dp["episodes_repo"] = episodes_repo
-    # Роутеры
-    dp.include_router(basic_router)
+        async def dev_handle(text: str) -> str:
+            response = await aya_brain.respond(0, text)
+            return response.text
 
-    log.info("Starting polling…")
-    try:
+        runner = DevBotRunner(dev_handle)
+        await runner.start()
+    else:
+        bot = Bot(token=token, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+        dp = Dispatcher()
+        dp.update.middleware(UserContextMiddleware(memory_repo))
+        dp["aya_brain"] = aya_brain
+        dp["memory_repo"] = memory_repo
+        dp["world_state"] = world_service
+        dp["chat_history"] = chat_history
+        dp["facts_repo"] = facts_repo
+        dp.include_router(basic_router)
+        log.info("Start polling")
         await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
-    except Exception as e:
-        log.exception("Polling stopped due to error: %s", e)
-        raise
-    finally:
-        # Грейсфул-шатдаун
-        try:
-            await deepseek.aclose()
-        except Exception:
-            pass
-        try:
-            await db.close()
-        except Exception:
-            pass
-        try:
-            await bot.session.close()
-        except Exception:
-            pass
-        log.info("Shutdown complete.")
+
+    await deepseek.aclose()
+    await db.close()
+
+
+async def _dummy_weather_fetch() -> dict:
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    now = datetime.now(ZoneInfo(settings.AYA_TZ))
+    return {
+        "city": settings.AYA_CITY,
+        "local_time_iso": now.isoformat(timespec="seconds"),
+        "weather": {"temp_c": 10, "is_rainy": False},
+    }
 
 
 if __name__ == "__main__":

@@ -1,0 +1,44 @@
+rules:
+  - id: base_warm
+    description: "Тёплый тон по умолчанию"
+    priority: 50
+    when:
+      intents: ["smalltalk", "greeting", "plan", "memory_query"]
+    effects:
+      tone: "warm"
+      emotion: "curious"
+      register: "casual"
+      style_mods:
+        variation: 3
+        emoji: "mirror"
+  - id: flirt_soften
+    description: "Флирт при согласии"
+    priority: 120
+    when:
+      intents: ["flirt"]
+      min_affinity: 2
+    effects:
+      tone: "playful"
+      emotion: "affection"
+      response_length: "medium"
+      follow_up: "invite_response"
+      style_mods:
+        flirt_level: "soft"
+  - id: rainy_day
+    description: "Дождливый день — уютный настрой"
+    priority: 60
+    when:
+      weather: ["rainy"]
+    effects:
+      tone: "cozy"
+      style_mods:
+        imagery: "indoors"
+  - id: concise_answers
+    description: "Короткий ответ, если собеседник лаконичный"
+    priority: 70
+    when:
+      max_affinity: 1
+    effects:
+      response_length: "short"
+      style_mods:
+        sentences: 2

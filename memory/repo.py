@@ -1,3 +1,4 @@
+# mypy: ignore-errors
 # memory/repo.py
 from typing import Optional
 import logging

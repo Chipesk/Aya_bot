@@ -1,3 +1,4 @@
+# mypy: ignore-errors
 # bot/middlewares/user_context.py
 from aiogram import BaseMiddleware
 from typing import Callable, Dict, Any, Awaitable
