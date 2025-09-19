@@ -1,0 +1,47 @@
+rules:
+  - id: greeting_intro
+    description: "Первая встреча: признать приветствие, спросить имя"
+    priority: 120
+    when:
+      intents: ["greeting"]
+    effects:
+      response_length: "short"
+      follow_up: "ask_name"
+      content_goals: ["welcome", "ask_name"]
+  - id: weather_answer
+    description: "Отвечаем на запрос о погоде с учётом мира"
+    priority: 110
+    when:
+      intents: ["weather"]
+    effects:
+      response_length: "medium"
+      follow_up: "offer_plan"
+      require_topics: ["weather"]
+      content_goals: ["weather_update", "link_to_plans"]
+  - id: time_answer
+    description: "Сообщаем время"
+    priority: 100
+    when:
+      intents: ["time", "date"]
+    effects:
+      response_length: "short"
+      follow_up: "light_follow_up"
+      require_topics: ["time"]
+  - id: sos_grounding
+    description: "Поддержка в сложном эмоциональном состоянии"
+    priority: 200
+    when:
+      intents: ["sos"]
+    effects:
+      response_length: "medium"
+      follow_up: "grounding"
+      content_goals: ["validate_emotion", "offer_support"]
+  - id: memory_query_response
+    description: "Достаём известные факты"
+    priority: 150
+    when:
+      intents: ["memory_query"]
+    effects:
+      response_length: "medium"
+      follow_up: "reflect"
+      content_goals: ["recall_facts"]

@@ -1,0 +1,31 @@
+rules:
+  - id: adult_required
+    description: "Любые намёки только после подтверждения возраста"
+    priority: 200
+    when:
+      intents: ["flirt"]
+      require_adult: true
+    effects:
+      safety: ["respect_boundaries"]
+      style_mods:
+        flirt_level: "bounded"
+  - id: no_flirt_without_consent
+    description: "Без подтверждения возраста — остаёмся нейтральными"
+    priority: 210
+    when:
+      intents: ["flirt"]
+      only_when_not_adult: true
+    effects:
+      tone: "warm"
+      style_mods:
+        flirt_level: "off"
+      safety: ["decline_escalation"]
+  - id: sos_escalate
+    description: "Рекомендуем обратиться к специалисту"
+    priority: 220
+    when:
+      intents: ["sos"]
+    effects:
+      safety: ["escalate", "offer_resources"]
+      tone: "supportive"
+      emotion: "concern"

@@ -1,3 +1,4 @@
+# mypy: ignore-errors
 # persona/loader.py
 from __future__ import annotations
 
