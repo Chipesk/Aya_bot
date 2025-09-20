@@ -67,6 +67,31 @@ class DB:
         if self._schema_ready:
             return
 
+        async def _table_columns(table: str) -> set[str]:
+            cur = await self.conn.execute(f"PRAGMA table_info('{table}')")
+            rows = await cur.fetchall()
+            await cur.close()
+            return {row["name"] for row in rows}
+
+        users_columns = await _table_columns("users")
+        memories_columns = await _table_columns("memories")
+
+        if users_columns and "updated_at" not in users_columns:
+            await self.conn.execute("DROP TRIGGER IF EXISTS users_touch")
+            await self.conn.execute("DROP TRIGGER IF EXISTS users_set_updated_at")
+            await self.conn.execute("ALTER TABLE users ADD COLUMN updated_at REAL")
+            await self.conn.execute(
+                "UPDATE users SET updated_at = strftime('%s','now') WHERE updated_at IS NULL"
+            )
+
+        if memories_columns and "updated_at" not in memories_columns:
+            await self.conn.execute("DROP TRIGGER IF EXISTS memories_touch")
+            await self.conn.execute("DROP TRIGGER IF EXISTS memories_set_updated_at")
+            await self.conn.execute("ALTER TABLE memories ADD COLUMN updated_at REAL")
+            await self.conn.execute(
+                "UPDATE memories SET updated_at = strftime('%s','now') WHERE updated_at IS NULL"
+            )
+
         await self.conn.execute(
             """
             CREATE TABLE IF NOT EXISTS users (
@@ -101,9 +126,10 @@ class DB:
             "CREATE INDEX IF NOT EXISTS idx_memories_kind ON memories(kind)"
         )
 
+        await self.conn.execute("DROP TRIGGER IF EXISTS users_touch")
         await self.conn.execute(
             """
-            CREATE TRIGGER IF NOT EXISTS users_touch AFTER UPDATE ON users
+            CREATE TRIGGER users_touch AFTER UPDATE ON users
             WHEN NEW.updated_at = OLD.updated_at
             BEGIN
                 UPDATE users SET updated_at = strftime('%s','now')
@@ -111,10 +137,33 @@ class DB:
             END;
             """
         )
+        await self.conn.execute("DROP TRIGGER IF EXISTS users_set_updated_at")
         await self.conn.execute(
             """
-            CREATE TRIGGER IF NOT EXISTS memories_touch AFTER UPDATE ON memories
+            CREATE TRIGGER users_set_updated_at AFTER INSERT ON users
+            WHEN NEW.updated_at IS NULL
+            BEGIN
+                UPDATE users SET updated_at = strftime('%s','now')
+                WHERE tg_user_id = NEW.tg_user_id;
+            END;
+            """
+        )
+        await self.conn.execute("DROP TRIGGER IF EXISTS memories_touch")
+        await self.conn.execute(
+            """
+            CREATE TRIGGER memories_touch AFTER UPDATE ON memories
             WHEN NEW.updated_at = OLD.updated_at
+            BEGIN
+                UPDATE memories SET updated_at = strftime('%s','now')
+                WHERE id = NEW.id;
+            END;
+            """
+        )
+        await self.conn.execute("DROP TRIGGER IF EXISTS memories_set_updated_at")
+        await self.conn.execute(
+            """
+            CREATE TRIGGER memories_set_updated_at AFTER INSERT ON memories
+            WHEN NEW.updated_at IS NULL
             BEGIN
                 UPDATE memories SET updated_at = strftime('%s','now')
                 WHERE id = NEW.id;
